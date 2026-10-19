@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SELF="$(readlink -f "$0")"
+cd "$(dirname "$SELF")"
+exec python3 -m media_asr "$@"

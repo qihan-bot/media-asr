@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SELF="$(readlink -f "$0")"
+ROOT="$(dirname "$SELF")"
+
+# Optional local config (not committed): host, user, key, Vault secret ref.
+ENV_FILE="${MEDIA_ASR_REMOTE_ENV:-$HOME/.config/media-asr/remote.env}"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+if [ -z "${MEDIA_ASR_REMOTE_HOST:-}" ]; then
+  echo "Set MEDIA_ASR_REMOTE_HOST or create $ENV_FILE" >&2
+  exit 1
+fi
+
+export MEDIA_ASR_BACKEND=remote
+export MEDIA_ASR_REMOTE_MODE="${MEDIA_ASR_REMOTE_MODE:-full}"
+
+if [ -n "${MEDIA_ASR_REMOTE_PASSWORD:-}" ] || [ -n "${MEDIA_ASR_REMOTE_KEY:-}" ]; then
+  exec "$ROOT/media-asr" "$@"
+fi
+if [ -n "${MEDIA_ASR_REMOTE_SECRET:-}" ]; then
+  exec vibe vault run \
+    --env "MEDIA_ASR_REMOTE_PASSWORD=${MEDIA_ASR_REMOTE_SECRET}" \
+    -- "$ROOT/media-asr" "$@"
+fi
+exec "$ROOT/media-asr" "$@"
