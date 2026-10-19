@@ -4,7 +4,6 @@ from pathlib import Path
 
 from media_asr.fetch import _feed_items, _parse_duration, resolve_source
 
-
 RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
   <channel>

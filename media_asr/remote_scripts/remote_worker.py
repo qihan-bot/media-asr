@@ -23,7 +23,6 @@ import wave
 import zipfile
 from pathlib import Path
 
-
 HALLUCINATIONS = (
     "字幕志愿者",
     "字幕",
@@ -228,8 +227,9 @@ def run_pyannote(wav_path: Path, job: dict) -> list[tuple[float, float, int]]:
         kwargs["num_speakers"] = num_speakers
 
     # Avoid torchcodec/FFmpeg DLL issues on Windows: feed the waveform directly.
-    import numpy as np
     import wave
+
+    import numpy as np
 
     with wave.open(str(wav_path), "rb") as handle:
         sample_rate = handle.getframerate()

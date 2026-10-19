@@ -18,7 +18,6 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-
 TERMS = [
     "厚雪长波",
     "王浩岚",

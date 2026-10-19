@@ -7,7 +7,6 @@ from pathlib import Path
 
 from .util import sanitize_proxy_env
 
-
 PROMPT = """你是播客/视频精读助手。请阅读文稿文件：{path}
 标题：{title}
 

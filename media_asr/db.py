@@ -8,7 +8,6 @@ from typing import Sequence
 from .config import DB_PATH
 from .util import item_id, now_iso
 
-
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;

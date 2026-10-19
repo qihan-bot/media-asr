@@ -3,7 +3,6 @@ from __future__ import annotations
 from media_asr.render import render_markdown, render_srt, render_text
 from media_asr.transcribe import TranscriptSegment
 
-
 SEGMENTS = [
     TranscriptSegment(0.0, 2.5, "第一段。", speaker="SPEAKER_00"),
     TranscriptSegment(3.0, 6.25, "第二段。", speaker="SPEAKER_01"),

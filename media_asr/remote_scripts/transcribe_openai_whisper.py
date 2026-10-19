@@ -23,7 +23,6 @@ import re
 import time
 from pathlib import Path
 
-
 HALLUCINATIONS = (
     "字幕志愿者",
     "字幕",
