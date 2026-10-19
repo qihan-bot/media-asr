@@ -23,21 +23,25 @@ import re
 import time
 from pathlib import Path
 
-HALLUCINATIONS = (
-    "字幕志愿者",
-    "字幕",
-    "校对",
-    "點贊",
-    "点赞",
-    "訂閱",
-    "订阅",
-    "打賞",
-    "打赏",
-    "明鏡",
-    "明镜",
-    "欄目",
-    "栏目",
+HALLUCINATION_PATTERNS = (
+    r"字幕志愿者",
+    r"字幕由[^。]{0,40}提供",
+    r"校对[:：]",
+    r"請不吝點贊訂閱轉發打賞",
+    r"请不吝点赞订阅转发打赏",
+    r"点赞订阅打赏",
+    r"明鏡與點點欄目",
+    r"明镜与点点栏目",
+    r"\b(?:subs?|subtitles?) by\b",
+    r"\bamara\.org\b",
+    r"thanks for watching",
 )
+
+
+def is_hallucination(text: str) -> bool:
+    if len(text) > 80:
+        return False
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in HALLUCINATION_PATTERNS)
 
 
 def clean_text(text: str) -> str:
@@ -127,7 +131,7 @@ def main() -> int:
     dropped = 0
     for segment in result.get("segments", []):
         text = segment.get("text", "").strip()
-        if any(phrase in text for phrase in HALLUCINATIONS):
+        if is_hallucination(text):
             dropped += 1
             continue
         text = clean_text(text)

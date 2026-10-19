@@ -43,6 +43,7 @@ class RemoteGPU:
         port: int = 22,
         workdir: str = "media-asr-work",
         python: str = r".venv\Scripts\python.exe",
+        shell: str = "cmd",
         model: str = "large-v3-turbo",
         model_dir: str = "models",
         language: str = "zh",
@@ -67,6 +68,7 @@ class RemoteGPU:
         self.port = port
         self.workdir = workdir
         self.python = python
+        self.shell = shell
         self.model = model
         self.model_dir = model_dir
         self.language = language
@@ -104,6 +106,8 @@ class RemoteGPU:
             or os.environ.get("MEDIA_ASR_REMOTE_WORKDIR", "media-asr-work"),
             python=getattr(args, "remote_python", None)
             or os.environ.get("MEDIA_ASR_REMOTE_PYTHON", r".venv\Scripts\python.exe"),
+            shell=getattr(args, "remote_shell", None)
+            or os.environ.get("MEDIA_ASR_REMOTE_SHELL", "cmd"),
             model=getattr(args, "remote_model", None)
             or os.environ.get("MEDIA_ASR_REMOTE_MODEL", "large-v3-turbo"),
             model_dir=getattr(args, "remote_model_dir", None)
@@ -214,15 +218,23 @@ class RemoteGPU:
     def _path(self, *parts: str) -> str:
         return posixpath.join(self._base(), *parts)
 
+    def _cd_prefix(self) -> str:
+        workdir = self.workdir.replace("\\", "/")
+        if self.shell == "sh":
+            target = workdir if workdir.startswith("/") else f"$HOME/{workdir}"
+            return f'cd "{target}" && '
+        target = workdir if re.match(r"^[A-Za-z]:/", workdir) else f"%USERPROFILE%\\{workdir}"
+        return f'cd /d "{target}" && '
+
     # ---- checks --------------------------------------------------------
     def check(self, progress: Callable[[str], None] | None = None) -> dict[str, object]:
         self.connect()
         commands = [
             "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader",
-            f'cd /d "%USERPROFILE%\\{Path(self.workdir).name}" && '
-            f'{self.python} -c "import torch, whisper; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"',
-            f'cd /d "%USERPROFILE%\\{Path(self.workdir).name}" && '
-            f'{self.python} -c "import yt_dlp, feedparser, httpx; print(yt_dlp.version.__version__, feedparser.__version__, httpx.__version__)"',
+            self._cd_prefix()
+            + f'{self.python} -c "import torch, whisper; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"',
+            self._cd_prefix()
+            + f'{self.python} -c "import yt_dlp, feedparser, httpx; print(yt_dlp.version.__version__, feedparser.__version__, httpx.__version__)"',
         ]
         gpu = self._exec(commands[0], timeout=60, progress=progress).strip()
         python = self._exec(commands[1], timeout=60, progress=progress).strip()
@@ -265,8 +277,8 @@ class RemoteGPU:
         self._upload_script()
 
         command = (
-            f'cd /d "%USERPROFILE%\\{Path(self.workdir).name}" && '
-            f'{self.python} transcribe_openai_whisper.py '
+            self._cd_prefix()
+            + f'{self.python} transcribe_openai_whisper.py '
             f'--audio "{remote_audio}" --output "{remote_output}" '
             f'--model "{model}" --language "{language}" '
             f'--download-root "{self.model_dir}" '
@@ -280,7 +292,7 @@ class RemoteGPU:
             log("downloading remote result")
             self._sftp.get(posixpath.join(self._base(), remote_output), str(local_result))
             payload = json.loads(local_result.read_text(encoding="utf-8"))
-        except Exception:
+        except BaseException:
             if not self.keep_remote:
                 self._cleanup(job_dir, ["audio.wav", "prompt.txt", "result.json"])
             raise
@@ -323,6 +335,8 @@ class RemoteGPU:
         keep_audio: bool = False,
         diarize: bool | None = None,
         num_speakers: int | None = None,
+        beam: int = 5,
+        traditional: bool = False,
         progress: Callable[[str], None] | None = None,
     ) -> dict[str, object]:
         """Run download, ffmpeg, Whisper, and rendering on the remote host."""
@@ -366,7 +380,8 @@ class RemoteGPU:
             "prompt": prompt or "",
             "model": model,
             "download_root": self.model_dir,
-            "beam": 5,
+            "beam": int(beam),
+            "traditional": bool(traditional),
             "keep_audio": bool(keep_audio),
             "diarize": self.diarize if diarize is None else bool(diarize),
             "num_speakers": self.num_speakers if num_speakers is None else int(num_speakers),
@@ -380,25 +395,25 @@ class RemoteGPU:
             "temperature": None,
             "job_dir": job_rel,
         }
-        job_path = posixpath.join(self._base(), job_rel, "job.json")
-        if self.diarization_backend == "pyannote" and self.hf_token:
-            token_rel = posixpath.join(job_rel, "hf_token.txt")
-            with self._sftp.open(posixpath.join(self._base(), token_rel), "w") as handle:
-                handle.write(self.hf_token + "\n")
-            job["hf_token_file"] = token_rel
-        with self._sftp.open(job_path, "w") as handle:
-            handle.write(json.dumps(job, ensure_ascii=False, indent=2))
-
-        self._upload_script("remote_worker.py")
-        self._upload_package()
-
         command = (
-            f'cd /d "%USERPROFILE%\\{Path(self.workdir).name}" && '
-            f'{self.python} remote_worker.py --job "{job_rel}/job.json"'
+            self._cd_prefix()
+            + f'{self.python} remote_worker.py --job "{job_rel}/job.json"'
         )
-        log(f"remote full pipeline on {self.host} ...")
         local_bundle = item_dir / "bundle.zip"
         try:
+            job_path = posixpath.join(self._base(), job_rel, "job.json")
+            if self.diarization_backend == "pyannote" and self.hf_token:
+                token_rel = posixpath.join(job_rel, "hf_token.txt")
+                with self._sftp.open(posixpath.join(self._base(), token_rel), "w") as handle:
+                    handle.write(self.hf_token + "\n")
+                job["hf_token_file"] = token_rel
+            with self._sftp.open(job_path, "w") as handle:
+                handle.write(json.dumps(job, ensure_ascii=False, indent=2))
+
+            self._upload_script("remote_worker.py")
+            self._upload_package()
+
+            log(f"remote full pipeline on {self.host} ...")
             self._exec(command, timeout=self.timeout, progress=log)
             log("downloading bundle")
             self._sftp.get(posixpath.join(self._base(), job_rel, "bundle.zip"), str(local_bundle))
@@ -413,20 +428,18 @@ class RemoteGPU:
             run = json.loads((item_dir / "run.json").read_text(encoding="utf-8"))
             local_bundle.unlink(missing_ok=True)
             remote_meta = json.loads((item_dir / "meta.json").read_text(encoding="utf-8"))
-        except Exception:
+        finally:
             if not self.keep_remote:
                 self._rmtree(job_dir)
-            raise
-        if not self.keep_remote:
-            self._rmtree(job_dir)
-        else:
-            log(f"remote job kept at {job_dir}")
+            else:
+                log(f"remote job kept at {job_dir}")
 
         segments = [
             TranscriptSegment(
                 start=float(segment["start"]),
                 end=float(segment["end"]),
                 text=str(segment.get("text", "")),
+                speaker=segment.get("speaker"),
             )
             for segment in transcript.get("segments", [])
             if str(segment.get("text", "")).strip()
@@ -521,7 +534,7 @@ class RemoteGPU:
                 pass
         try:
             self._sftp.rmdir(job_dir)
-        except IOError:
+        except Exception:
             pass
 
     def _exec(

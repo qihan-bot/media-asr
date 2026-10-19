@@ -23,34 +23,38 @@ import wave
 import zipfile
 from pathlib import Path
 
-HALLUCINATIONS = (
-    "字幕志愿者",
-    "字幕",
-    "校對",
-    "校对",
-    "點贊",
-    "点赞",
-    "訂閱",
-    "订阅",
-    "打賞",
-    "打赏",
-    "明鏡",
-    "明镜",
-    "欄目",
-    "栏目",
+HALLUCINATION_PATTERNS = (
+    r"字幕志愿者",
+    r"字幕由[^。]{0,40}提供",
+    r"校对[:：]",
+    r"請不吝點贊訂閱轉發打賞",
+    r"请不吝点赞订阅转发打赏",
+    r"点赞订阅打赏",
+    r"明鏡與點點欄目",
+    r"明镜与点点栏目",
+    r"\b(?:subs?|subtitles?) by\b",
+    r"\bamara\.org\b",
+    r"thanks for watching",
 )
 
 
-def clean_text(text: str) -> str:
+def is_hallucination(text: str) -> bool:
+    if len(text) > 80:
+        return False
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in HALLUCINATION_PATTERNS)
+
+
+def clean_text(text: str, simplify: bool = True) -> str:
     text = text.strip()
     text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
     text = re.sub(r"\s+([，。！？；：、])", r"\1", text)
-    try:
-        import zhconv
-    except ImportError:
-        pass
-    else:
-        text = zhconv.convert(text, "zh-cn")
+    if simplify:
+        try:
+            import zhconv
+        except ImportError:
+            pass
+        else:
+            text = zhconv.convert(text, "zh-cn")
     return text.strip()
 
 
@@ -122,7 +126,11 @@ def speaker_for_interval(
     return nearest
 
 
-def build_speaker_segments(raw_segments: list, turns: list[tuple[float, float, int]]) -> list:
+def build_speaker_segments(
+    raw_segments: list,
+    turns: list[tuple[float, float, int]],
+    simplify: bool = True,
+) -> list:
     from media_asr.transcribe import TranscriptSegment
 
     words = []
@@ -141,7 +149,7 @@ def build_speaker_segments(raw_segments: list, turns: list[tuple[float, float, i
         segments = []
         for raw in raw_segments:
             speaker = speaker_for_interval(float(raw["start"]), float(raw["end"]), turns)
-            text = clean_text(raw.get("text", ""))
+            text = clean_text(raw.get("text", ""), simplify=simplify)
             if text:
                 segments.append(
                     TranscriptSegment(
@@ -193,7 +201,7 @@ def build_speaker_segments(raw_segments: list, turns: list[tuple[float, float, i
         bucket = buckets.get(index) or []
         if not bucket:
             continue
-        text = clean_text("".join(item[2] for item in bucket))
+        text = clean_text("".join(item[2] for item in bucket), simplify=simplify)
         if not text:
             continue
         segments.append(
@@ -212,10 +220,16 @@ def run_pyannote(wav_path: Path, job: dict) -> list[tuple[float, float, int]]:
     from pyannote.audio import Pipeline
 
     token = os.environ.get("HF_TOKEN")
-    pipeline = Pipeline.from_pretrained(
-        job.get("pyannote_pipeline", "pyannote/speaker-diarization-3.1"),
-        token=token,
-    )
+    try:
+        pipeline = Pipeline.from_pretrained(
+            job.get("pyannote_pipeline", "pyannote/speaker-diarization-3.1"),
+            token=token,
+        )
+    except TypeError:
+        pipeline = Pipeline.from_pretrained(
+            job.get("pyannote_pipeline", "pyannote/speaker-diarization-3.1"),
+            use_auth_token=token,
+        )
     if pipeline is None:
         raise RuntimeError("pyannote pipeline could not be loaded; check HF access")
     if torch.cuda.is_available():
@@ -243,7 +257,9 @@ def run_pyannote(wav_path: Path, job: dict) -> list[tuple[float, float, int]]:
     waveform = torch.from_numpy(samples)
     diarization = pipeline({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
 
-    annotation = diarization.exclusive_speaker_diarization
+    annotation = getattr(
+        diarization, "exclusive_speaker_diarization", diarization
+    )
     labels = sorted(annotation.labels())
     index = {label: position for position, label in enumerate(labels)}
     return [
@@ -350,7 +366,9 @@ def main() -> int:
         else:
             turns = run_diarization(wav_path, job)
         diarization_elapsed = round(time.time() - diarization_started, 1)
-        segments = build_speaker_segments(raw_segments, turns)
+        segments = build_speaker_segments(
+            raw_segments, turns, simplify=not bool(job.get("traditional"))
+        )
         speakers = sorted({segment.speaker for segment in segments if segment.speaker})
         print(
             f"worker: diarization {len(turns)} turns, {len(speakers)} speakers, "
@@ -360,7 +378,9 @@ def main() -> int:
     else:
         segments = []
         for segment in raw_segments:
-            text = clean_text(segment.get("text", ""))
+            text = clean_text(
+                segment.get("text", ""), simplify=not bool(job.get("traditional"))
+            )
             if text:
                 segments.append(
                     TranscriptSegment(
@@ -373,7 +393,7 @@ def main() -> int:
     dropped = 0
     filtered = []
     for segment in segments:
-        if any(phrase in segment.text for phrase in HALLUCINATIONS):
+        if is_hallucination(segment.text):
             dropped += 1
             continue
         if segment.text:

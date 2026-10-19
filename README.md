@@ -246,6 +246,7 @@ Override the data directory with `MEDIA_ASR_DATA`. Model cache defaults to
 | `MEDIA_ASR_REMOTE_KEY` | SSH private key |
 | `MEDIA_ASR_REMOTE_WORKDIR` | Remote work directory (default `media-asr-work`) |
 | `MEDIA_ASR_REMOTE_PYTHON` | Remote Python (default `.venv\Scripts\python.exe`) |
+| `MEDIA_ASR_REMOTE_SHELL` | Remote shell for `cd`/Python commands (`cmd` or `sh`) |
 | `MEDIA_ASR_REMOTE_MODEL` | Remote Whisper model (default `large-v3-turbo`) |
 | `MEDIA_ASR_REMOTE_MODE` | `asr` or `full` |
 | `MEDIA_ASR_REMOTE_PASSWORD` | SSH password (prefer a key or a secret manager) |

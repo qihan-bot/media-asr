@@ -69,6 +69,12 @@ def add_remote_options(parser: argparse.ArgumentParser, *, backend: bool = True,
         default=os.environ.get("MEDIA_ASR_REMOTE_PYTHON", r".venv\Scripts\python.exe"),
     )
     parser.add_argument(
+        "--remote-shell",
+        choices=["cmd", "sh"],
+        default=os.environ.get("MEDIA_ASR_REMOTE_SHELL", "cmd"),
+        help="remote shell used for cd/python commands",
+    )
+    parser.add_argument(
         "--remote-model",
         default=os.environ.get("MEDIA_ASR_REMOTE_MODEL", "large-v3-turbo"),
     )
@@ -250,6 +256,7 @@ def cmd_add(store: Store, args: argparse.Namespace) -> int:
         return 1
 
     added = 0
+    new_ids: list[str] = []
     for spec in result.specs:
         if args.title and len(result.specs) == 1:
             spec.title = args.title
@@ -265,10 +272,12 @@ def cmd_add(store: Store, args: argparse.Namespace) -> int:
         state = "added" if created else "exists"
         _log(f"{state:6} {item_id}  {spec.title}")
         added += int(created)
+        if created:
+            new_ids.append(item_id)
 
     _log(f"{added} new item(s), {len(result.specs) - added} existing")
-    if args.run and added:
-        return cmd_run(store, args)
+    if args.run and new_ids:
+        return cmd_run(store, args, item_ids=new_ids)
     return 0
 
 
@@ -279,16 +288,21 @@ def cmd_refresh(store: Store, args: argparse.Namespace) -> int:
         return 0
 
     total_new = 0
+    new_ids: list[str] = []
+    checked = 0
+    failed = 0
     for feed in feeds:
+        checked += 1
         latest = args.latest if args.latest is not None else feed["latest"]
         try:
             result = resolve_source(feed["url"], latest=latest)
         except Exception as exc:
+            failed += 1
             _log(f"feed failed: {feed['url']}: {exc}")
             continue
         new = 0
         for spec in result.specs:
-            _, created = store.add_item(
+            item_id, created = store.add_item(
                 source=spec.source,
                 source_type=spec.source_type,
                 title=spec.title,
@@ -298,17 +312,28 @@ def cmd_refresh(store: Store, args: argparse.Namespace) -> int:
                 meta_json=spec.meta_json(),
             )
             new += int(created)
+            if created:
+                new_ids.append(item_id)
         store.touch_feed(feed["url"])
         total_new += new
         _log(f"{feed['title'] or feed['url']}: {new} new / {len(result.specs)} checked")
     _log(f"{total_new} new item(s)")
-    if args.run and total_new:
-        return cmd_run(store, args)
+    if checked and failed == checked:
+        _log("all feeds failed")
+        return 1
+    if args.run and new_ids:
+        return cmd_run(store, args, item_ids=new_ids)
     return 0
 
 
-def cmd_run(store: Store, args: argparse.Namespace) -> int:
-    if args.retry_failed:
+def cmd_run(
+    store: Store,
+    args: argparse.Namespace,
+    item_ids: list[str] | None = None,
+) -> int:
+    if item_ids is not None:
+        items = [row for item_id in item_ids if (row := store.get_item(item_id)) is not None]
+    elif args.retry_failed:
         items = store.list_items(retry_failed=True, limit=args.limit)
     else:
         items = store.list_items(status="pending", limit=args.limit)
@@ -391,6 +416,8 @@ def _process_item(
                 keep_audio=args.keep_audio,
                 diarize=args.diarize,
                 num_speakers=args.num_speakers,
+                beam=args.beam,
+                traditional=args.traditional,
                 progress=_log,
             )
             result = TranscriptResult(

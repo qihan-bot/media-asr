@@ -3,9 +3,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-PROJECT_ROOT = Path(
-    os.environ.get("MEDIA_ASR_HOME", Path(__file__).resolve().parent.parent)
-).expanduser()
+_SOURCE_ROOT = Path(__file__).resolve().parent.parent
+if os.environ.get("MEDIA_ASR_HOME"):
+    PROJECT_ROOT = Path(os.environ["MEDIA_ASR_HOME"]).expanduser()
+elif (_SOURCE_ROOT / "pyproject.toml").exists():
+    PROJECT_ROOT = _SOURCE_ROOT
+else:
+    PROJECT_ROOT = Path.home() / ".local/share/media-asr"
 DATA_DIR = Path(os.environ.get("MEDIA_ASR_DATA", PROJECT_ROOT / "data")).expanduser()
 ITEMS_DIR = DATA_DIR / "items"
 DB_PATH = DATA_DIR / "media.db"

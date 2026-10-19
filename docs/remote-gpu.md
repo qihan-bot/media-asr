@@ -194,7 +194,7 @@ Diarization on the 94-minute, 5-speaker episode:
 
 ## Linux notes
 
-The remote worker's `cd` command is written for Windows `cmd.exe`
-(`cd /d "%USERPROFILE%\..."`). For a Linux host, run the worker through a small
-wrapper or override the remote layout. Contributions for a native POSIX remote
-runner are welcome.
+Set `MEDIA_ASR_REMOTE_SHELL=sh` and `MEDIA_ASR_REMOTE_PYTHON=.venv/bin/python`
+for a POSIX remote host. The worker uses `cd "$HOME/<workdir>"` (or the
+absolute workdir when one is configured). Absolute Windows directories are
+also supported without collapsing them to a single path component.

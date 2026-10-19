@@ -14,3 +14,9 @@ data/
 bundle.zip
 remote_result.json
 .env
+models/
+*.onnx
+*.pt
+*.bin
+*.safetensors
+*.zip

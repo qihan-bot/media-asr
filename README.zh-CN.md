@@ -102,6 +102,7 @@ python3 -m pip install feedparser zhconv paramiko
 --diarize                                   # 说话人分离
 --num-speakers 4                            # -1 自动判断
 --diarization-backend sherpa|pyannote       # 默认 sherpa
+--remote-shell cmd|sh                       # 远端 shell（默认 cmd）
 ```
 
 ## 远程 GPU 后端
@@ -232,6 +233,7 @@ data/
 | `MEDIA_ASR_REMOTE_KEY` | SSH 私钥 |
 | `MEDIA_ASR_REMOTE_WORKDIR` | 远端工作目录（默认 `media-asr-work`） |
 | `MEDIA_ASR_REMOTE_PYTHON` | 远端 Python（默认 `.venv\Scripts\python.exe`） |
+| `MEDIA_ASR_REMOTE_SHELL` | 远端 `cd`/Python 命令使用的 shell（`cmd` 或 `sh`） |
 | `MEDIA_ASR_REMOTE_MODEL` | 远端 Whisper 模型（默认 `large-v3-turbo`） |
 | `MEDIA_ASR_REMOTE_MODE` | `asr` 或 `full` |
 | `MEDIA_ASR_REMOTE_PASSWORD` | SSH 密码（优先用 key 或密钥管理） |
