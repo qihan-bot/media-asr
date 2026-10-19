@@ -20,3 +20,12 @@ models/
 *.bin
 *.safetensors
 *.zip
+remote.env
+.env.local
+*.opus
+*.ogg
+*.m4b
+*.aac
+*.wma
+*.mov
+*.avi

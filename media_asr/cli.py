@@ -332,7 +332,9 @@ def cmd_run(
     item_ids: list[str] | None = None,
 ) -> int:
     if item_ids is not None:
-        items = [row for item_id in item_ids if (row := store.get_item(item_id)) is not None]
+        items = [
+            row for item_id in item_ids if (row := store.get_item(item_id)) is not None
+        ][: args.limit]
     elif args.retry_failed:
         items = store.list_items(retry_failed=True, limit=args.limit)
     else:
@@ -505,6 +507,8 @@ def _process_item(
                 language=args.language or None,
                 prompt=args.prompt,
                 model=args.remote_model,
+                beam=args.beam,
+                traditional=args.traditional,
                 progress=_log,
             )
         else:
@@ -656,6 +660,8 @@ def cmd_retranscribe(store: Store, args: argparse.Namespace) -> int:
                 language=args.language or None,
                 prompt=args.prompt,
                 model=args.remote_model,
+                beam=args.beam,
+                traditional=args.traditional,
                 progress=_log,
             )
             elapsed = time.monotonic() - started

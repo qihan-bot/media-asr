@@ -19,16 +19,17 @@ class RemoteError(RuntimeError):
     pass
 
 
-def _clean_text(text: str) -> str:
+def _clean_text(text: str, *, simplify: bool = True) -> str:
     text = text.strip()
     text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
     text = re.sub(r"\s+([，。！？；：、])", r"\1", text)
-    try:
-        import zhconv
-    except ImportError:
-        pass
-    else:
-        text = zhconv.convert(text, "zh-cn")
+    if simplify:
+        try:
+            import zhconv
+        except ImportError:
+            pass
+        else:
+            text = zhconv.convert(text, "zh-cn")
     return text.strip()
 
 
@@ -256,6 +257,8 @@ class RemoteGPU:
         language: str | None = None,
         prompt: str | None = None,
         model: str | None = None,
+        beam: int = 5,
+        traditional: bool = False,
         progress: Callable[[str], None] | None = None,
     ) -> TranscriptResult:
         self.connect()
@@ -270,38 +273,56 @@ class RemoteGPU:
         remote_output = posixpath.join(job_rel, "result.json")
 
         log = progress or (lambda _: None)
-        log(f"uploading audio to {self.host}:{remote_audio}")
-        self._upload(audio_path, posixpath.join(self._base(), remote_audio), progress=log)
-        with self._sftp.open(posixpath.join(self._base(), remote_prompt), "w") as handle:
-            handle.write(prompt or "")
-        self._upload_script()
-
-        command = (
-            self._cd_prefix()
-            + f'{self.python} transcribe_openai_whisper.py '
-            f'--audio "{remote_audio}" --output "{remote_output}" '
-            f'--model "{model}" --language "{language}" '
-            f'--download-root "{self.model_dir}" '
-            f'--prompt-file "{remote_prompt}"'
-            + (" --condition-on-previous-text" if self.condition_on_previous_text else "")
-        )
-        log(f"remote transcribing with {model} on {self.host} ...")
+        success = False
         local_result = audio_path.parent / "remote_result.json"
         try:
+            log(f"uploading audio to {self.host}:{remote_audio}")
+            self._upload(
+                audio_path,
+                posixpath.join(self._base(), remote_audio),
+                progress=log,
+            )
+            with self._sftp.open(posixpath.join(self._base(), remote_prompt), "w") as handle:
+                handle.write(prompt or "")
+            self._upload_script()
+
+            command = (
+                self._cd_prefix()
+                + f'{self.python} transcribe_openai_whisper.py '
+                f'--audio "{remote_audio}" --output "{remote_output}" '
+                f'--model "{model}" --language "{language}" '
+                f'--download-root "{self.model_dir}" '
+                f'--beam {int(beam)} '
+                f'--prompt-file "{remote_prompt}"'
+                + (
+                    " --condition-on-previous-text"
+                    if self.condition_on_previous_text
+                    else ""
+                )
+                + (" --keep-traditional" if traditional else "")
+            )
+            log(f"remote transcribing with {model} on {self.host} ...")
             self._exec(command, timeout=self.timeout, progress=log)
             log("downloading remote result")
             self._sftp.get(posixpath.join(self._base(), remote_output), str(local_result))
             payload = json.loads(local_result.read_text(encoding="utf-8"))
-        except BaseException:
-            if not self.keep_remote:
-                self._cleanup(job_dir, ["audio.wav", "prompt.txt", "result.json"])
-            raise
+            success = True
+        finally:
+            if not success or not self.keep_remote:
+                self._cleanup(
+                    job_dir,
+                    ["audio.wav", "prompt.txt", "result.json", "remote_result.json"],
+                )
+            else:
+                log(f"remote job kept at {job_dir}")
 
         segments = [
             TranscriptSegment(
                 start=float(segment["start"]),
                 end=float(segment["end"]),
-                text=_clean_text(str(segment.get("text", ""))),
+                text=_clean_text(
+                    str(segment.get("text", "")), simplify=not traditional
+                ),
             )
             for segment in payload.get("segments", [])
             if str(segment.get("text", "")).strip()
@@ -346,18 +367,26 @@ class RemoteGPU:
         item_id = str(item["id"])
         job_rel = posixpath.join("jobs", re.sub(r"[^A-Za-z0-9_.-]+", "_", item_id))
         job_dir = self._path(job_rel)
-        self._mkdirs(job_dir)
 
         source = str(item["source"])
         source_type = str(item.get("source_type") or "audio")
         job_source = source
-        if Path(source).expanduser().is_file():
-            local_source = Path(source).expanduser()
-            remote_name = f"source{local_source.suffix.lower() or '.bin'}"
-            log(f"uploading source file {local_source.name} to {self.host}")
-            self._upload(local_source, posixpath.join(self._base(), job_rel, remote_name), progress=log)
-            job_source = posixpath.join(job_rel, remote_name)
-            source_type = "file"
+        try:
+            self._mkdirs(job_dir)
+            if Path(source).expanduser().is_file():
+                local_source = Path(source).expanduser()
+                remote_name = f"source{local_source.suffix.lower() or '.bin'}"
+                log(f"uploading source file {local_source.name} to {self.host}")
+                self._upload(
+                    local_source,
+                    posixpath.join(self._base(), job_rel, remote_name),
+                    progress=log,
+                )
+                job_source = posixpath.join(job_rel, remote_name)
+                source_type = "file"
+        except BaseException:
+            self._rmtree(job_dir)
+            raise
 
         meta = {}
         if item.get("meta_json"):
@@ -400,6 +429,8 @@ class RemoteGPU:
             + f'{self.python} remote_worker.py --job "{job_rel}/job.json"'
         )
         local_bundle = item_dir / "bundle.zip"
+        token_rel = None
+        success = False
         try:
             job_path = posixpath.join(self._base(), job_rel, "job.json")
             if self.diarization_backend == "pyannote" and self.hf_token:
@@ -428,8 +459,14 @@ class RemoteGPU:
             run = json.loads((item_dir / "run.json").read_text(encoding="utf-8"))
             local_bundle.unlink(missing_ok=True)
             remote_meta = json.loads((item_dir / "meta.json").read_text(encoding="utf-8"))
+            success = True
         finally:
-            if not self.keep_remote:
+            if token_rel:
+                try:
+                    self._sftp.remove(posixpath.join(self._base(), token_rel))
+                except Exception:
+                    pass
+            if not success or not self.keep_remote:
                 self._rmtree(job_dir)
             else:
                 log(f"remote job kept at {job_dir}")
