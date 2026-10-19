@@ -327,11 +327,6 @@ class RemoteGPU:
             for segment in payload.get("segments", [])
             if str(segment.get("text", "")).strip()
         ]
-        if not self.keep_remote:
-            self._cleanup(job_dir, ["audio.wav", "prompt.txt", "result.json", "remote_result.json"])
-        else:
-            log(f"remote job kept at {job_dir}")
-
         label = f"{payload.get('model', 'openai-whisper ' + model)} @ {self.host}"
         log(
             f"remote done: {len(segments)} segments, "
