@@ -6,7 +6,8 @@ pyannote sometimes puts host and guest into a single label (e.g. one label with
 done item without ``rediarize.json`` whose largest label holds more than
 ``--share`` of the speaking time, DeepSeek reads samples of that label and
 decides whether it mixes several people and how many people talk in the
-episode. Merged items are re-run on the remote GPU with that count plus one
+episode. Merged items whose largest label holds over 90% of the time, or with
+3+ people, are re-run on the remote GPU with that count plus one
 (an extra cluster absorbs intro voices and clips; with the bare count pyannote
 can still merge host and guest, e.g. 硅谷101 E247),
 their ``enrich.json`` is removed so ``enrich_podcasts.py`` names them again,
@@ -148,7 +149,10 @@ def main() -> int:
             if args.dry_run:
                 continue
             record = {"checked_at": now_iso(), "label": label, "share_before": before, **verdict}
-            if merged and people >= 2:
+            # Library run 2026-10-23: re-diarizing every flagged episode moved the largest
+            # label by <3 points in 81 of 86 cases (a guest holding ~80% of a long
+            # interview is normal); it only helped hard merges and 3+ people.
+            if merged and people >= 2 and (before > 0.9 or people >= 3):
                 lang = "zh" if (row["language"] or "").startswith("zh") else "en"
                 cmd = [
                     str(ROOT / "media-asr-remote"),
