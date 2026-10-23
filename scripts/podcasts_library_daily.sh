@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Daily refresh of the multi-show podcast library (data-podcasts/):
 # new episodes -> remote GPU transcript + pyannote diarization (per-show
-# language) -> DeepSeek punctuation + speaker names.
+# language) -> re-diarize episodes whose largest label merged several people
+# -> DeepSeek punctuation + speaker names.
 #
 # GPU: 5900x-128g (RTX 3080 Ti) when reachable, else x18-max-5090 (shared with
 # the All-In daily). Every step is idempotent, so a failed run can be re-run as
@@ -54,6 +55,10 @@ for feed in "${!SHOWS[@]}"; do
 done
 failed="$(./media-asr list --status failed --limit 1000 | tail -n +2)"
 if [[ -n $failed ]]; then echo "FAILED episodes:"; echo "$failed"; status=1; fi
+
+echo "== re-diarize episodes where one label merged several people"
+vibe vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value --env HF_TOKEN=HF_TOKEN.value -- \
+  python3 scripts/rediarize_merged.py || status=1
 
 echo "== punctuation + speaker names"
 vibe vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value -- \

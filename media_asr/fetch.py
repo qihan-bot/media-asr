@@ -5,6 +5,7 @@ import html
 import json
 import mimetypes
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -412,7 +413,7 @@ def download(item: dict, dest_dir: Path, progress: Callable[[str], None] | None 
     direct_first = item.get("source_type") in {"podcast", "audio"}
     if direct_first:
         try:
-            path = _download_direct(download_url, dest_dir, referer=referer)
+            path = _download_direct_retry(download_url, dest_dir, referer=referer, progress=progress)
         except Exception as direct_error:
             if progress:
                 progress(f"direct download failed, trying yt-dlp: {direct_error}")
@@ -466,6 +467,23 @@ def _download_ytdlp(url: str, dest_dir: Path, referer: str | None = None) -> Pat
     if not candidates:
         raise RuntimeError("yt-dlp reported success but produced no file")
     return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _download_direct_retry(
+    url: str, dest_dir: Path, *, referer: str | None, progress=None, attempts: int = 3
+) -> Path:
+    """Direct download with retries: podcast CDNs drop connections now and then
+    (SSL EOF, server disconnect) and a single failure would fail the episode."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return _download_direct(url, dest_dir, referer=referer)
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            if progress:
+                progress(f"direct download attempt {attempt} failed, retrying: {exc}")
+            time.sleep(15 * attempt)
+    raise AssertionError("unreachable")
 
 
 def _download_direct(url: str, dest_dir: Path, referer: str | None = None) -> Path:

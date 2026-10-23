@@ -52,3 +52,19 @@ def test_resolve_local_file(tmp_path: Path) -> None:
     assert result.specs[0].source_type == "file"
     assert result.specs[0].title == "sample"
     assert result.specs[0].extra["local"] is True
+
+def test_direct_download_retries_transient_errors(tmp_path, monkeypatch) -> None:
+    from media_asr import fetch
+
+    calls = []
+
+    def flaky(url, dest_dir, *, referer=None):
+        calls.append(url)
+        if len(calls) < 3:
+            raise ConnectionError("SSL EOF")
+        return dest_dir / "audio.mp3"
+
+    monkeypatch.setattr(fetch, "_download_direct", flaky)
+    monkeypatch.setattr(fetch.time, "sleep", lambda s: None)
+    assert fetch._download_direct_retry("https://cdn/x.mp3", tmp_path, referer=None) == tmp_path / "audio.mp3"
+    assert len(calls) == 3

@@ -144,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--run", action="store_true", help="process immediately")
 
     run = sub.add_parser("run", parents=[run_parent], help="process pending items")
+    run.add_argument("--ids", nargs="+", default=None, help="process exactly these items, whatever their status")
     run.set_defaults(command="run")
 
     refresh = sub.add_parser("refresh", parents=[run_parent], help="check subscribed feeds for new episodes")
@@ -205,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "add":
             return cmd_add(store, args)
         if args.command == "run":
-            return cmd_run(store, args)
+            return cmd_run(store, args, item_ids=args.ids)
         if args.command == "refresh":
             return cmd_refresh(store, args)
         if args.command == "list":

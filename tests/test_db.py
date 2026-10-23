@@ -48,3 +48,20 @@ def test_add_and_search(tmp_path: Path) -> None:
     assert store.get_item(item_id) is None
     assert store.search("语音识别") == []
     store.close()
+
+def test_add_item_dedupes_same_title_in_same_feed(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    feed = "https://feed.example/show/rss"
+    first, created = store.add_item(
+        source="https://old-host.example/ep1.mp3", source_type="podcast", title="Ep 1", feed_url=feed
+    )
+    assert created
+    again, created = store.add_item(
+        source="https://new-host.example/ep1.mp3", source_type="podcast", title="Ep 1", feed_url=feed
+    )
+    assert (again, created) == (first, False)
+    other, created = store.add_item(
+        source="https://new-host.example/ep1-b.mp3", source_type="podcast", title="Ep 1",
+        feed_url="https://feed.example/other/rss",
+    )
+    assert created and other != first

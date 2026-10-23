@@ -60,9 +60,25 @@ PUNCT_PROMPT = {
     ),
 }
 
+# Recurring hosts who rarely say their own names on air (feed URL substring ->
+# hint). Only shows where the transcript alone left hosts unnamed.
+SHOW_HOSTS = {
+    "feed/podcast/1084089": (
+        "swyx (Shawn Wang; editor of Latent Space, organizer of the AI Engineer "
+        "conference, AIE) and Alessio Fanelli (partner at Kernel Labs)"
+    ),
+    "rss.buzzsprout.com/2630998": "Brian Heater",
+    "destinations/2292818": "Claire Asher",
+}
+UNNAMED = {
+    "zh": {"host": "主持人", "guest": "嘉宾", "other": "说话人"},
+    "en": {"host": "Host", "guest": "Guest", "other": "Speaker"},
+}
+
 SPEAKER_PROMPT = """You label speakers in a podcast transcript produced by speech recognition and diarization.
 
 Show: {show}
+Known recurring hosts: {hosts}
 Episode title: {title}
 Show notes (from the RSS feed; may list host and guests):
 {notes}
@@ -76,7 +92,12 @@ Transcript excerpt:
 For each SPEAKER_XX label, give the person's name as it is used in the show
 (Chinese names in Chinese, English names in English), their role (host, guest,
 or other), and your confidence (high, medium, low). Use only evidence from the
-show notes and transcript; never invent a name. If one person was split across
+show notes and transcript; never invent a name. A known host may be named from role and context
+(for example who welcomes the guest or talks about their own projects), but
+only with medium or high confidence, and only when something in the transcript or
+show notes points to that particular host. Being the host is not enough when
+the show has several recurring hosts: then use null for the name with role
+"host". If one person was split across
 several labels, give each of those labels the same name. If a label is music,
 an ad or an intro voice, use role "other". If there is not enough evidence,
 use null for the name.
@@ -101,6 +122,8 @@ def chat(client: httpx.Client, key: str, system: str, user: str, max_tokens: int
     }
     last: Exception | None = None
     for attempt in range(3):
+        # Greedy decoding repeats a malformed answer; retries sample a little.
+        payload["temperature"] = 0 if attempt == 0 else 0.3
         try:
             response = client.post(
                 API_URL, headers={"Authorization": f"Bearer {key}"}, json=payload, timeout=300
@@ -224,6 +247,9 @@ def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, worker
         stats, excerpt = speaker_context(segments)
         prompt = SPEAKER_PROMPT.format(
             show=titles.get(row["feed_url"], row["feed_url"] or ""),
+            hosts=next(
+                (v for k, v in SHOW_HOSTS.items() if k in (row["feed_url"] or "")), "(not given)"
+            ),
             title=row["title"],
             notes=notes.get(meta.get("audio_url") or row["source"], "(not available)"),
             stats=stats,
@@ -231,14 +257,17 @@ def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, worker
         )
         raw = chat(client, key, "You label podcast speakers. Output valid JSON only.", prompt, 2000)
         raw = raw.get("speakers", raw)
-        unknown = 0
+        unknown: dict[str, int] = {}
         for label in labels:
             info = raw.get(label) or {}
             name = (info.get("name") or "").strip() if isinstance(info, dict) else ""
             confidence = info.get("confidence", "low") if isinstance(info, dict) else "low"
             if not name or confidence not in ("high", "medium"):
-                unknown += 1
-                name = f"说话人{unknown}" if lang == "zh" else f"Speaker {unknown}"
+                role = info.get("role") if isinstance(info, dict) else None
+                role = role if role in ("host", "guest") else "other"
+                unknown[role] = unknown.get(role, 0) + 1
+                sep = "" if lang == "zh" else " "
+                name = f"{UNNAMED[lang][role]}{sep}{unknown[role]}"
             names[label] = {
                 "name": name,
                 "role": info.get("role") if isinstance(info, dict) else None,
