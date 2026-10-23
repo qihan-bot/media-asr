@@ -29,3 +29,4 @@ remote.env
 *.wma
 *.mov
 *.avi
+/data-podcasts*/

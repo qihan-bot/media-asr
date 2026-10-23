@@ -39,6 +39,7 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--keep-audio", action="store_true", help="keep the normalized 16 kHz WAV")
     parser.add_argument("--offline", action="store_true", help="never download a model")
     parser.add_argument("--limit", type=int, default=100, help="max items to process")
+    parser.add_argument("--feed-contains", default=None, help="only process items whose feed URL contains this text")
     parser.add_argument("--retry-failed", action="store_true", help="retry failed items")
     parser.add_argument("--fail-fast", action="store_true", help="stop at the first failure")
     add_remote_options(parser)
@@ -335,10 +336,15 @@ def cmd_run(
         items = [
             row for item_id in item_ids if (row := store.get_item(item_id)) is not None
         ][: args.limit]
-    elif args.retry_failed:
-        items = store.list_items(retry_failed=True, limit=args.limit)
     else:
-        items = store.list_items(status="pending", limit=args.limit)
+        feed_filter = getattr(args, "feed_contains", None)
+        fetch = 1_000_000 if feed_filter else args.limit
+        if args.retry_failed:
+            items = store.list_items(retry_failed=True, limit=fetch)
+        else:
+            items = store.list_items(status="pending", limit=fetch)
+        if feed_filter:
+            items = [row for row in items if feed_filter in (row["feed_url"] or "")][: args.limit]
     if not items:
         _log("nothing to do")
         return 0
