@@ -2,6 +2,8 @@
 
 ## 0.0.2 — 2026-10-24
 
+Supersedes 0.01 (PEP 440 reads "0.01" as 0.1, which would sort after 0.0.2).
+
 Podcast library: the process scripts became package modules and subcommands.
 
 - `media-asr library-update`: the daily pipeline in Python (refresh → per-show
