@@ -343,8 +343,8 @@ data/
 | `HF_TOKEN` | pyannote 模型所需的 HuggingFace token |
 | `DEEPSEEK_API_KEY` | DeepSeek API key（摘要、播客库） |
 | `MEDIA_ASR_LLM_MODEL` | 播客库各步骤使用的 DeepSeek 模型（默认 `deepseek-flash`） |
-| `MEDIA_ASR_GPU_ENV` | `library-update`、`scripts/podcast_daily.sh`：首选 GPU 主机的 env 文件 |
-| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`、`scripts/podcast_daily.sh`：备用 GPU 主机的 env 文件 |
+| `MEDIA_ASR_GPU_ENV` | `library-update`：首选 GPU 主机的 env 文件 |
+| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`：备用 GPU 主机的 env 文件 |
 
 ## 性能参考
 
@@ -386,10 +386,10 @@ python3 -m ruff check .
 
 ```text
 media_asr/          CLI、抓取、ASR、数据库、渲染、远程客户端，
-                    播客库（library、llm、enrich、terms、rediarize）
+                    播客库（library、llm、enrich、terms、rediarize、voiceprint）
 scripts/            远端 worker、OpenAI Whisper 辅助脚本、对比工具、
-                    All-In 说话人工具、每日任务包装脚本
-tests/              离线单元测试
+                    每日任务包装脚本、All-In 迁移脚本（migrate_allin.py）
+tests/              离线测试
 docs/remote-gpu.md  远程 GPU 安装与基准
 docs/examples/      播客库配置示例
 ```

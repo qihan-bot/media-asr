@@ -373,8 +373,8 @@ Override the data directory with `MEDIA_ASR_DATA`. Model cache defaults to
 | `HF_TOKEN` | HuggingFace token for pyannote models |
 | `DEEPSEEK_API_KEY` | DeepSeek API key (summaries, podcast library) |
 | `MEDIA_ASR_LLM_MODEL` | DeepSeek model of the podcast library steps (default `deepseek-flash`) |
-| `MEDIA_ASR_GPU_ENV` | `library-update`, `scripts/podcast_daily.sh`: env file of the preferred GPU host |
-| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`, `scripts/podcast_daily.sh`: env file of the fallback GPU host |
+| `MEDIA_ASR_GPU_ENV` | `library-update`: env file of the preferred GPU host |
+| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`: env file of the fallback GPU host |
 
 ## Performance
 
@@ -421,10 +421,11 @@ Project layout:
 
 ```text
 media_asr/          CLI, fetch, ASR, DB, rendering, remote client,
-                    podcast library (library, llm, enrich, terms, rediarize)
+                    podcast library (library, llm, enrich, terms, rediarize,
+                    voiceprint)
 scripts/            remote worker, OpenAI Whisper helper, comparison tool,
-                    All-In speaker tools, daily wrappers
-tests/              offline unit tests
+                    daily wrapper, All-In migration (migrate_allin.py)
+tests/              offline tests
 docs/remote-gpu.md  remote GPU setup and benchmarks
 docs/examples/      podcast library config
 ```
