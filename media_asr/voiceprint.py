@@ -227,15 +227,21 @@ def current(item_dir: Path, digest: str | None) -> dict | None:
     return data if digest and data.get("transcript_sha256") == digest else None
 
 
-def voices(item_dir: Path, digest: str) -> dict | None:
-    """voiceprint.json for ``enrich``: None without one; raises if it judged
-    another transcript."""
-    if not (item_dir / MARKER).exists():
-        return None
-    data = current(item_dir, digest)
-    if data is None:
+def voices(item_dir: Path, digest: str) -> tuple[dict | None, str | None]:
+    """voiceprint.json for ``enrich`` and the SHA-256 of the bytes read, which
+    ``enrich`` checks again before it commits; (None, None) without one. Raises
+    if it judged another transcript."""
+    try:
+        raw = (item_dir / MARKER).read_bytes()
+    except FileNotFoundError:
+        return None, None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict) or data.get("transcript_sha256") != digest:
         raise RuntimeError("voiceprint.json is for another transcript; run media-asr voiceprint")
-    return data
+    return data, hashlib.sha256(raw).hexdigest()
 
 
 def write(item_dir: Path, data: dict) -> None:

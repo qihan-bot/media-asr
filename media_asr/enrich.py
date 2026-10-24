@@ -202,7 +202,8 @@ def enrich_item(
         seg["text"] = text
 
     labels = sorted({s["speaker"] for s in segments if s.get("speaker")})
-    voice = voices(items_dir / row["id"], digest) or {}
+    voice, voice_digest = voices(items_dir / row["id"], digest)
+    voice = voice or {}
     sounds = voice.get("speakers", {})
     heard = {
         label: sounds[label] for label in labels if sounds.get(label, {}).get("voice") == "match"
@@ -281,7 +282,14 @@ def enrich_item(
         "language": data.get("language") or row["language"],
         "model": (data.get("model") or "") + f" + {llm.model} punctuation/speaker names",
     }
-    return {"row": row, "segments": segments, "report": report, "render": render, "input": digest}
+    return {
+        "row": row,
+        "segments": segments,
+        "report": report,
+        "render": render,
+        "input": digest,
+        "voiceprint": voice_digest,  # None: there was none
+    }
 
 
 def commit(db: sqlite3.Connection, result: dict, items_dir: Path, *, force: bool = False) -> bool:
@@ -289,7 +297,7 @@ def commit(db: sqlite3.Connection, result: dict, items_dir: Path, *, force: bool
 
     Holds the item's lock throughout. Returns False without writing if another
     run enriched the item meanwhile (unless ``force``); raises if the
-    transcript changed after it was read.
+    transcript or its voiceprint.json (or its absence) changed after it was read.
     """
     row = result["row"]
     item_dir = items_dir / row["id"]
@@ -298,6 +306,8 @@ def commit(db: sqlite3.Connection, result: dict, items_dir: Path, *, force: bool
             return False
         if file_digest(item_dir / "transcript.json") != result["input"]:
             raise RuntimeError("transcript.json changed while enriching; the next run redoes it")
+        if file_digest(item_dir / "voiceprint.json") != result["voiceprint"]:
+            raise RuntimeError("voiceprint.json changed while enriching; the next run redoes it")
         for marker in ("enrich.json", "terms.json"):
             (item_dir / marker).unlink(missing_ok=True)
         write_named(item_dir, item_id=row["id"], segments=result["segments"], **result["render"])

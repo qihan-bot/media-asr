@@ -405,3 +405,32 @@ def test_enrich_without_voiceprints_asks_as_before(library) -> None:
     (prompt,) = llm.prompts
     assert "identified by voice" not in prompt and prompt.endswith('"short reason"}}}\n')
     assert named(items_dir, item)["SPEAKER_00"]["name"] == "B Host"
+
+
+def test_a_voiceprint_written_while_enriching_wins(library) -> None:
+    # Review 0.0.4 #1: names computed before the voiceprint landed were committed
+    # over it, and the done marker kept the voiceprint names out for good.
+    store, items_dir, data_dir = library
+    item = episode(store, items_dir, 1)
+    namer = Namer({"SPEAKER_00": {"name": "B Host", "role": "host", "confidence": "high"}})
+    late = E.enrich_item(store.get_item(item), {}, {}, [SHOW], namer, 1, items_dir)
+    assert late["voiceprint"] is None
+    assert run(store, items_dir, data_dir, Embedder()) == 0  # lands meanwhile
+    with pytest.raises(RuntimeError, match="voiceprint.json changed while enriching"):
+        E.commit(store.conn, late, items_dir)
+    assert not (items_dir / item / "enrich.json").exists()
+    assert E.run(store.conn, namer, [SHOW], items_dir=items_dir) == 0
+    assert named(items_dir, item)["SPEAKER_00"]["name"] == "A Host"
+
+
+def test_a_voiceprint_redone_while_enriching_fails_the_commit(library) -> None:
+    store, items_dir, item = voiced(library)
+    stale = E.enrich_item(store.get_item(item), {}, {}, [SHOW], Namer({}), 1, items_dir)
+    path = items_dir / item / "voiceprint.json"  # redone meanwhile, with another result
+    marker = json.loads(path.read_text())
+    marker["speakers"]["SPEAKER_01"].update(voice="match", name="B Host", confidence="medium")
+    path.write_text(json.dumps(marker))
+    with pytest.raises(RuntimeError, match="voiceprint.json changed"):
+        E.commit(store.conn, stale, items_dir)
+    fresh = E.enrich_item(store.get_item(item), {}, {}, [SHOW], Namer({}), 1, items_dir)
+    assert E.commit(store.conn, fresh, items_dir)
