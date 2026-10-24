@@ -105,13 +105,14 @@ def rerun_remote(item_id: str, language: str, num_speakers: int) -> subprocess.C
 
 
 def parse_verdict(verdict) -> tuple[bool, int]:
-    """(merged, people) from the model's answer; ValueError if it is malformed."""
+    """(merged, people) from the model's answer; ValueError if it is malformed:
+    merged must be true or false, people a whole number of at least 1."""
     if not isinstance(verdict, dict) or not isinstance(verdict.get("merged"), bool):
         raise ValueError(f"malformed verdict: {json.dumps(verdict, ensure_ascii=False)[:200]}")
-    try:
-        return verdict["merged"], int(verdict.get("people") or 0)
-    except (TypeError, ValueError):
-        raise ValueError(f"people is not a number: {verdict.get('people')!r}") from None
+    people = verdict.get("people")
+    if isinstance(people, bool) or not isinstance(people, int) or people < 1:
+        raise ValueError(f"people is not a count of at least 1: {people!r}")
+    return verdict["merged"], people
 
 
 def check(row, llm: LLM, *, share: float, dry_run: bool, items_dir: Path, rerun) -> bool:

@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from media_asr import cli
 from media_asr import enrich as E
 from media_asr import rediarize as R
@@ -260,7 +262,7 @@ def test_one_bad_episode_does_not_stop_the_others(tmp_path: Path, capsys) -> Non
     assert marked == [4]
     out = capsys.readouterr().out
     assert out.count("FAIL") == 4
-    assert "people is not a number: 'two'" in out and "malformed verdict" in out
+    assert "people is not a count of at least 1: 'two'" in out and "malformed verdict" in out
     store.close()
 
 
@@ -352,4 +354,15 @@ def test_newer_state_after_the_rerun_is_kept(tmp_path: Path, monkeypatch) -> Non
     monkeypatch.setattr(R, "item_lock", lock)
     assert R.run(store.conn, Verdict(HARD_MERGE), items_dir=items_dir, rerun=rerun_only) == 0
     assert len(entries) == 2 and not marker.exists()
+    store.close()
+
+
+@pytest.mark.parametrize("people", [None, False, True, [], 0, -1, "2", 2.5])
+@pytest.mark.parametrize("merged", [True, False])
+def test_invalid_people_fails_the_episode(tmp_path: Path, merged: bool, people) -> None:
+    store, items_dir, item = one_episode(tmp_path)
+    reruns = []
+    llm = Verdict({"merged": merged, "people": people, "reason": "x"})
+    assert R.run(store.conn, llm, items_dir=items_dir, rerun=lambda *a: reruns.append(a)) == 1
+    assert reruns == [] and not (items_dir / item / "rediarize.json").exists()
     store.close()
