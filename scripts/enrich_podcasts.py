@@ -210,7 +210,8 @@ def speaker_context(segments: list[dict], limit: int = 16000) -> tuple[str, str]
 
 
 def load_show_notes(db: sqlite3.Connection) -> tuple[dict[str, str], dict[str, str]]:
-    """Map audio URL -> plain-text show notes, and feed URL -> show title."""
+    """Map audio URL and "feed URL<TAB>episode title" -> plain-text show notes,
+    and feed URL -> show title. The title key survives a feed changing hosts."""
     notes: dict[str, str] = {}
     titles: dict[str, str] = {}
     for url, title in db.execute("SELECT url, title FROM feeds"):
@@ -224,10 +225,20 @@ def load_show_notes(db: sqlite3.Connection) -> tuple[dict[str, str], dict[str, s
             body = entry.get("summary") or entry.get("description") or ""
             text = html.unescape(re.sub(r"<[^>]+>", " ", body))
             text = re.sub(r"\s+", " ", text).strip()[:3000]
+            notes[f"{url}\t{entry.get('title', '')}"] = text
             for link in entry.get("enclosures", []):
                 if link.get("href"):
                     notes[link["href"]] = text
     return notes, titles
+
+
+def episode_notes(notes: dict, row: sqlite3.Row) -> str:
+    meta = json.loads(row["meta_json"] or "{}")
+    return (
+        notes.get(meta.get("audio_url") or row["source"])
+        or notes.get(f"{row['feed_url']}\t{row['title']}")
+        or "(not available)"
+    )
 
 
 def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, workers: int) -> dict:
@@ -235,8 +246,6 @@ def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, worker
     data = json.loads((item_dir / "transcript.json").read_text(encoding="utf-8"))
     segments = [s for s in data.get("segments", []) if str(s.get("text", "")).strip()]
     lang = "zh" if (row["language"] or data.get("language") or "").startswith("zh") else "en"
-    meta = json.loads(row["meta_json"] or "{}")
-
     texts, accepted = punctuate(client, key, [s["text"] for s in segments], lang, workers)
     for seg, text in zip(segments, texts):
         seg["text"] = text
@@ -251,7 +260,7 @@ def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, worker
                 (v for k, v in SHOW_HOSTS.items() if k in (row["feed_url"] or "")), "(not given)"
             ),
             title=row["title"],
-            notes=notes.get(meta.get("audio_url") or row["source"], "(not available)"),
+            notes=episode_notes(notes, row),
             stats=stats,
             transcript=excerpt,
         )
@@ -327,6 +336,13 @@ def write_index(db: sqlite3.Connection, result: dict) -> None:
             "UPDATE items SET transcript_path = ?, updated_at = ? WHERE id = ?",
             (str(item_dir / "transcript_named.md"), now_iso(), row["id"]),
         )
+    # Punctuated, named text before term correction; correct_terms.py always
+    # starts from this file, and must run again after every enrichment.
+    atomic_write(
+        item_dir / "named_base.json",
+        json.dumps(result["segments"], ensure_ascii=False) + "\n",
+    )
+    (item_dir / "terms.json").unlink(missing_ok=True)
     # enrich.json is the completion marker, written after the index is updated.
     atomic_write(
         item_dir / "enrich.json", json.dumps(result["report"], ensure_ascii=False, indent=2) + "\n"

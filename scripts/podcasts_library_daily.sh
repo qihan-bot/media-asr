@@ -2,7 +2,7 @@
 # Daily refresh of the multi-show podcast library (data-podcasts/):
 # new episodes -> remote GPU transcript + pyannote diarization (per-show
 # language) -> re-diarize episodes whose largest label merged several people
-# -> DeepSeek punctuation + speaker names.
+# -> DeepSeek punctuation + speaker names -> audited term correction.
 #
 # GPU: 5900x-128g (RTX 3080 Ti) when reachable, else x18-max-5090 (shared with
 # the All-In daily). Every step is idempotent, so a failed run can be re-run as
@@ -63,6 +63,10 @@ vibe vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value --env HF_TOKEN=HF_T
 echo "== punctuation + speaker names"
 vibe vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value -- \
   python3 scripts/enrich_podcasts.py --workers 4 || status=1
+
+echo "== term correction (audited replacement pairs, see terms.json)"
+vibe vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value -- \
+  python3 scripts/correct_terms.py --workers 4 || status=1
 
 echo "== $(date -Is) end status=$status"
 ./media-asr stats
