@@ -21,11 +21,20 @@ from .config import (
 )
 from .db import Store
 from .fetch import download, normalize_audio, resolve_source
+from .library import STEP_MARKERS
 from .remote import RemoteGPU
 from .render import render_all
 from .summarize import available_engines, summarize
 from .transcribe import Transcriber, TranscriptResult
-from .util import atomic_write, ffprobe_duration, hms, now_iso, sanitize_proxy_env, slugify
+from .util import (
+    atomic_write,
+    ffprobe_duration,
+    hms,
+    item_lock,
+    now_iso,
+    sanitize_proxy_env,
+    slugify,
+)
 
 
 def add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -437,7 +446,8 @@ def cmd_run(
         for row in items:
             item = dict(row)
             _log(f"\n== {item['id']}  {item['title']}")
-            ok = _process_item(store, item, transcriber, args, remote=remote)
+            with item_lock(ITEMS_DIR / item["id"]):
+                ok = _process_item(store, item, transcriber, args, remote=remote)
             if not ok:
                 failures += 1
                 if args.fail_fast:
@@ -462,6 +472,10 @@ def _process_item(
     item_id = item["id"]
     item_dir = ITEMS_DIR / item_id
     item_dir.mkdir(parents=True, exist_ok=True)
+    # A new transcript makes the podcast library's later steps stale: drop their
+    # markers before it is written, so they run again even if this attempt fails.
+    for marker in STEP_MARKERS:
+        (item_dir / marker).unlink(missing_ok=True)
 
     try:
         if remote is not None and remote.mode == "full":

@@ -10,7 +10,10 @@ episode. Merged items whose largest label holds over 90% of the time, or with
 (an extra cluster absorbs intro voices and clips; with the bare count pyannote
 can still merge host and guest, e.g. 硅谷101 E247),
 their ``enrich.json`` is removed so ``enrich`` names them again,
-and ``rediarize.json`` records the decision so no item is checked twice.
+and ``rediarize.json`` records the decision so no item is checked twice. The
+re-run goes through ``media-asr run``, which takes the item's lock itself; the
+marker is written under the lock, after checking that the transcript the
+decision was made on is still there.
 
 ``media-asr rediarize`` needs ``DEEPSEEK_API_KEY`` and ``HF_TOKEN``; the GPU host
 comes from ``MEDIA_ASR_REMOTE_ENV`` as for ``media-asr-remote``.
@@ -25,9 +28,9 @@ from collections import Counter
 from pathlib import Path
 
 from .config import ITEMS_DIR
-from .library import REMOTE, ROOT
+from .library import REMOTE, ROOT, file_digest, read_json
 from .llm import LLM
-from .util import atomic_write, now_iso
+from .util import atomic_write, item_lock, now_iso
 
 PROMPT = """A podcast episode was split into speaker labels by automatic diarization.
 Episode title: {title}
@@ -119,11 +122,8 @@ def run(
         transcript = item_dir / "transcript.json"
         if marker.exists() or not transcript.exists():
             continue
-        segments = [
-            s
-            for s in json.loads(transcript.read_text(encoding="utf-8"))["segments"]
-            if str(s.get("text", "")).strip()
-        ]
+        data, digest = read_json(transcript)
+        segments = [s for s in data["segments"] if str(s.get("text", "")).strip()]
         shares = label_shares(segments)
         if not segments or shares.most_common(1)[0][1] <= share:
             continue
@@ -153,6 +153,8 @@ def run(
         # label by <3 points in 81 of 86 cases (a guest holding ~80% of a long
         # interview is normal); it only helped hard merges and 3+ people.
         if merged and people >= 2 and (before > 0.9 or people >= 3):
+            # Not under the item's lock: `run` takes it, and drops the later
+            # steps' markers before it writes the new transcript.
             lang = "zh" if (row["language"] or "").startswith("zh") else "en"
             result = rerun(row["id"], lang, people + 1)
             if result.returncode != 0:
@@ -162,11 +164,19 @@ def run(
                     flush=True,
                 )
                 continue
-            after = label_shares(
-                json.loads(transcript.read_text(encoding="utf-8"))["segments"]
-            ).most_common(1)[0][1]
-            record["share_after"] = round(after, 3)
-            (item_dir / "enrich.json").unlink(missing_ok=True)
+            with item_lock(item_dir):
+                after = label_shares(read_json(transcript)[0]["segments"]).most_common(1)[0][1]
+                record["share_after"] = round(after, 3)
+                (item_dir / "enrich.json").unlink(missing_ok=True)
+                atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
             print(f"       rerun: largest label {before:.0%} -> {after:.0%}", flush=True)
-        atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+            continue
+        with item_lock(item_dir):
+            if marker.exists():
+                continue  # checked by another run meanwhile
+            if file_digest(transcript) != digest:
+                failed += 1
+                print(f"FAIL check {row['id']}: transcript.json changed meanwhile", flush=True)
+                continue
+            atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
     return 1 if failed else 0

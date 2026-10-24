@@ -4,8 +4,12 @@ import json
 import subprocess
 from pathlib import Path
 
+from media_asr import cli
+from media_asr import enrich as E
 from media_asr import rediarize as R
 from media_asr.db import Segment, Store
+from media_asr.render import render_all
+from media_asr.transcribe import TranscriptSegment
 
 # title -> (largest label share, model verdict)
 EPISODES = {
@@ -113,4 +117,107 @@ def test_rediarize_shards_split_the_items(tmp_path: Path) -> None:
         seen.append(set(llm.titles))
     assert not seen[0] & seen[1]
     assert seen[0] | seen[1] == {"hard merge", "three people", "long answer", "one voice"}
+    store.close()
+
+
+class FakeRemote:
+    """Remote full pipeline stand-in: fails, or writes a new two-speaker transcript."""
+
+    mode, model, user, host = "full", "fake", "fake", "fake"
+
+    def __init__(self, fail: bool) -> None:
+        self.fail = fail
+
+    def connect(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def run_full(self, item, item_dir, **kwargs):
+        if self.fail:
+            raise RuntimeError("remote failed")
+        segs = [
+            TranscriptSegment(0.0, 10.0, "new transcript", "SPEAKER_00"),
+            TranscriptSegment(10.0, 20.0, "new second speaker", "SPEAKER_01"),
+        ]
+        render_all(
+            out_dir=item_dir,
+            item_id=item["id"],
+            title="Ep",
+            source=item["source"],
+            duration=20.0,
+            language="en",
+            model="asr-2",
+            transcribed_at="t",
+            segments=segs,
+        )
+        return {"segments": segs, "language": "en", "duration": 20.0, "model_label": "asr-2"}
+
+
+class Punctuator:
+    model = "fake"
+
+    def chat(self, system: str, user: str, max_tokens: int) -> dict:
+        if "label podcast speakers" in system:
+            return {"speakers": {}}
+        return {"lines": [line + "." for line in user.split("\n")]}
+
+
+def test_a_new_transcript_makes_later_steps_run_again(tmp_path: Path, monkeypatch) -> None:
+    store = Store(tmp_path / "media.db")
+    items_dir = tmp_path / "items"
+    item, _ = store.add_item(source="https://a/1.mp3", source_type="podcast", title="Ep")
+    segs = [TranscriptSegment(0.0, 10.0, "hello world", "SPEAKER_00")]
+    render_all(
+        out_dir=items_dir / item,
+        item_id=item,
+        title="Ep",
+        source="https://a/1.mp3",
+        duration=10.0,
+        language="en",
+        model="asr",
+        transcribed_at="t",
+        segments=segs,
+    )
+    store.save_result(
+        item, segments=segs, duration=10.0, language="en", model="asr", transcript_path="t.md"
+    )
+    assert E.run(store.conn, Punctuator(), [], items_dir=items_dir) == 0
+    (items_dir / item / "terms.json").write_text("{}")  # as if corrected
+    monkeypatch.setattr(cli, "ITEMS_DIR", items_dir)
+    remote = FakeRemote(fail=True)
+    monkeypatch.setattr(cli.RemoteGPU, "from_args", lambda args: remote)
+    parser = cli.build_parser()
+
+    def rerun(item_id: str, language: str, num_speakers: int):
+        args = parser.parse_args(
+            ["run", "--ids", item_id, "--backend", "remote", "--remote-mode", "full", "--diarize"]
+        )
+        return subprocess.CompletedProcess([], cli.cmd_run(store, args, item_ids=args.ids), "", "")
+
+    class Merged:
+        def chat(self, *args) -> dict:
+            return {"merged": True, "people": 2, "reason": "asks and answers"}
+
+    # The re-run fails: the item is failed and none of the later markers survive.
+    assert R.run(store.conn, Merged(), items_dir=items_dir, rerun=rerun) == 1
+    assert store.get_item(item)["status"] == "failed"
+    assert not [
+        m
+        for m in ("rediarize.json", "enrich.json", "terms.json")
+        if (items_dir / item / m).exists()
+    ]
+    # The daily retry transcribes it again; every later step then runs on the new transcript.
+    remote.fail = False
+    args = parser.parse_args(
+        ["run", "--retry-failed", "--backend", "remote", "--remote-mode", "full", "--diarize"]
+    )
+    assert cli.cmd_run(store, args) == 0
+    assert R.run(store.conn, Merged(), items_dir=items_dir, rerun=rerun) == 0  # balanced now
+    assert E.run(store.conn, Punctuator(), [], items_dir=items_dir) == 0
+    named = json.loads((items_dir / item / "transcript_named.json").read_text())["segments"]
+    assert [s["text"] for s in named] == ["new transcript.", "new second speaker."]
+    assert [r["text"] for r in store.segments_for(item)] == [s["text"] for s in named]
+    assert not (items_dir / item / "terms.json").exists()  # correct-terms runs again
     store.close()

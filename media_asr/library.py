@@ -43,6 +43,9 @@ REMOTE = ROOT / "media-asr-remote"
 MEDIA_ASR = [sys.executable, "-m", "media_asr"]
 LANGUAGES = ("zh", "en")
 SHOW_KEYS = {"name", "feed", "language", "hosts"}
+# Completion markers of the steps built on transcript.json; `media-asr run`
+# drops them before it writes a new transcript, so these steps run again.
+STEP_MARKERS = ("rediarize.json", "enrich.json", "terms.json")
 # Remote ASR progress lines; dropped from the update log.
 PROGRESS = re.compile(r"frames/s|still running")
 
