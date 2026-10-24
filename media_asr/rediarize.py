@@ -16,7 +16,9 @@ Check, re-run and marker happen under one hold of the item's lock: the verdict
 is acted on only if the transcript the model judged is still the episode's
 transcript and no other run has decided meanwhile; the re-run happens in this
 process, and the marker records the transcript that re-run wrote. No other run
-can write the episode until the marker is down.
+can write the episode until the marker is down. The model checks run
+``--workers`` at a time and change nothing; the verdicts are then acted on one
+episode at a time, in order, so re-runs reach the GPU host one after another.
 
 Run it as ``media-asr-remote rediarize`` (``library-update`` does) so the
 re-runs reach the GPU host of ``MEDIA_ASR_REMOTE_ENV``; it needs
@@ -28,6 +30,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .config import ITEMS_DIR
@@ -98,18 +101,24 @@ def parse_verdict(verdict) -> tuple[bool, int]:
     return verdict["merged"], people
 
 
-def check(row, llm: LLM, *, share: float, dry_run: bool, items_dir: Path, rerun) -> bool:
-    """Check one episode and redo it if needed; False if the check or re-run failed."""
+class CheckFailed(RuntimeError):
+    """The model gave no usable verdict on an episode."""
+
+
+def judge(row, llm: LLM, *, share: float, items_dir: Path) -> dict | None:
+    """The model's verdict on one episode, changing nothing; None if the episode
+    needs no check (marked, not transcribed, or no label over ``share``).
+    Raises CheckFailed if the answer is unusable."""
     item_dir = items_dir / row["id"]
     marker = item_dir / "rediarize.json"
     transcript = item_dir / "transcript.json"
     if marker.exists() or not transcript.exists():
-        return True
+        return None
     data, digest = read_json(transcript)
     segments = [s for s in data["segments"] if str(s.get("text", "")).strip()]
     shares = label_shares(segments)
     if not segments or shares.most_common(1)[0][1] <= share:
-        return True
+        return None
     label, prompt = build_prompt(row["title"], segments, shares)
     try:
         verdict = llm.chat(
@@ -119,9 +128,25 @@ def check(row, llm: LLM, *, share: float, dry_run: bool, items_dir: Path, rerun)
         )
         merged, people = parse_verdict(verdict)
     except Exception as exc:  # noqa: BLE001 - leave unmarked, retried next run
-        print(f"FAIL check {row['id']}: {exc}", flush=True)
-        return False
-    before = round(shares[label], 3)
+        raise CheckFailed(str(exc)) from exc
+    return {
+        "digest": digest,
+        "label": label,
+        "before": round(shares[label], 3),
+        "verdict": verdict,
+        "merged": merged,
+        "people": people,
+    }
+
+
+def act(row, judged: dict, *, dry_run: bool, items_dir: Path, rerun) -> bool:
+    """Report a verdict and, unless ``dry_run``, redo the episode if needed and
+    mark it; False if the re-run failed or the transcript changed meanwhile."""
+    item_dir = items_dir / row["id"]
+    marker = item_dir / "rediarize.json"
+    transcript = item_dir / "transcript.json"
+    label, before, verdict = judged["label"], judged["before"], judged["verdict"]
+    merged, people, digest = judged["merged"], judged["people"], judged["digest"]
     print(
         f"{'MERGED' if merged else 'ok    '} {before:.0%} people={people} {row['title'][:50]} "
         f"| {str(verdict.get('reason', ''))[:100]}",
@@ -173,9 +198,12 @@ def run(
     shard: str = "0/1",
     items_dir: Path = ITEMS_DIR,
     rerun=None,
+    workers: int = 1,
 ) -> int:
     """Check and redo merged episodes; return 1 if any episode failed.
 
+    The model checks run ``workers`` at a time and change nothing; the
+    verdicts are then acted on one episode at a time, in order.
     ``rerun(item_id, language, num_speakers)`` transcribes an episode again
     while this step holds its lock and returns the SHA-256 of the
     transcript.json it wrote (``media-asr rediarize`` passes the remote GPU
@@ -184,10 +212,27 @@ def run(
     """
     index, shards = (int(x) for x in shard.split("/"))
     rows = db.execute("SELECT * FROM items WHERE status = 'done' ORDER BY published_at").fetchall()
-    failed = 0
-    for row in rows[index::shards]:
+    rows = rows[index::shards]
+
+    def judged(row):
         try:
-            ok = check(row, llm, share=share, dry_run=dry_run, items_dir=items_dir, rerun=rerun)
+            return judge(row, llm, share=share, items_dir=items_dir), None
+        except Exception as exc:  # noqa: BLE001 - this episode only; retried next run
+            return None, exc
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        verdicts = list(pool.map(judged, rows))
+    failed = 0
+    for row, (verdict, error) in zip(rows, verdicts):
+        if error is not None:
+            kind = "FAIL check" if isinstance(error, CheckFailed) else "FAIL"
+            print(f"{kind} {row['id']}: {error}", flush=True)
+            failed += 1
+            continue
+        if verdict is None:
+            continue
+        try:
+            ok = act(row, verdict, dry_run=dry_run, items_dir=items_dir, rerun=rerun)
         except Exception as exc:  # noqa: BLE001 - this episode only; retried next run
             ok = False
             print(f"FAIL {row['id']}: {exc}", flush=True)

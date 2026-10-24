@@ -136,6 +136,13 @@ def add_remote_options(parser: argparse.ArgumentParser, *, backend: bool = True,
     )
 
 
+def _at_least_one(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1: {text}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     run_parent = argparse.ArgumentParser(add_help=False)
     add_run_options(run_parent)
@@ -221,6 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="only report decisions; change nothing"
     )
     rediarize.add_argument("--shard", default="0/1", help="i/n: every n-th item, for parallel GPUs")
+    rediarize.add_argument(
+        "--workers",
+        type=_at_least_one,
+        default=1,
+        help="model checks in parallel; re-runs go one at a time",
+    )
 
     library = sub.add_parser(
         "library-update",
@@ -238,7 +251,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     library.add_argument("--latest", type=int, default=5, help="episodes to check per feed")
     library.add_argument(
-        "--workers", type=int, default=4, help="items in parallel for enrich and correct-terms"
+        "--workers",
+        type=_at_least_one,
+        default=4,
+        help="items in parallel for the model steps (rediarize checks, enrich, correct-terms)",
+    )
+    library.add_argument(
+        "--jobs",
+        type=_at_least_one,
+        default=1,
+        help="episodes transcribed at a time on the --gpu-env host; they take turns on its "
+        "GPU and overlap their downloads (the fallback host gets one at a time)",
     )
 
     sub.add_parser("feeds", help="list subscribed feeds")
@@ -930,7 +953,13 @@ def cmd_rediarize(store: Store, args: argparse.Namespace) -> int:
 
     with LLM(key) as llm:
         return rediarize.run(
-            store.conn, llm, share=args.share, dry_run=args.dry_run, shard=args.shard, rerun=rerun
+            store.conn,
+            llm,
+            share=args.share,
+            dry_run=args.dry_run,
+            shard=args.shard,
+            rerun=rerun,
+            workers=args.workers,
         )
 
 
@@ -984,6 +1013,7 @@ def cmd_library_update(store: Store, args: argparse.Namespace) -> int:
             fallback_gpu_env=args.fallback_gpu_env,
             latest=args.latest,
             workers=args.workers,
+            jobs=args.jobs,
         )
     except LibraryError as exc:
         print(f"error: {exc}", file=sys.stderr)

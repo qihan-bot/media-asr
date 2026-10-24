@@ -429,3 +429,44 @@ def test_invalid_people_fails_the_episode(tmp_path: Path, merged: bool, people) 
     assert R.run(store.conn, llm, items_dir=items_dir, rerun=lambda *a: reruns.append(a)) == 1
     assert reruns == [] and not (items_dir / item / "rediarize.json").exists()
     store.close()
+
+
+def test_checks_run_in_parallel_and_reruns_one_at_a_time(tmp_path: Path, capsys) -> None:
+    guard = threading.Lock()
+    outputs, peaks = [], []
+    for workers in (1, 4):
+        store, items_dir, ids = make_library(tmp_path / str(workers))
+        running = {"check": 0, "rerun": 0}
+        peak = {"check": 0, "rerun": 0}
+
+        def enter(kind: str) -> None:
+            with guard:
+                running[kind] += 1
+                peak[kind] = max(peak[kind], running[kind])
+            time.sleep(0.05)
+            with guard:
+                running[kind] -= 1
+
+        class SlowLLM(FakeLLM):
+            def chat(self, system: str, prompt: str, max_tokens: int) -> dict:
+                enter("check")
+                return super().chat(system, prompt, max_tokens)
+
+        reruns = []
+
+        def rerun(item_id: str, language: str, num_speakers: int):
+            enter("rerun")
+            reruns.append(item_id)
+            transcript = items_dir / item_id / "transcript.json"
+            transcript.write_text(json.dumps({"segments": segments(0.55)}))
+            return file_digest(transcript)
+
+        assert R.run(store.conn, SlowLLM(), items_dir=items_dir, rerun=rerun, workers=workers) == 0
+        assert sorted(reruns) == sorted([ids["hard merge"], ids["three people"]])
+        marked = {t for t, item in ids.items() if (items_dir / item / "rediarize.json").exists()}
+        assert marked == {"hard merge", "three people", "long answer", "one voice"}
+        outputs.append(capsys.readouterr().out)
+        peaks.append(peak)
+        store.close()
+    assert peaks == [{"check": 1, "rerun": 1}, {"check": 4, "rerun": 1}]
+    assert outputs[0] == outputs[1]  # verdicts are reported and acted on in order

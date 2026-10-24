@@ -23,8 +23,10 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +50,8 @@ SHOW_KEYS = {"name", "feed", "language", "hosts"}
 STEP_MARKERS = ("rediarize.json", "enrich.json", "terms.json")
 # Remote ASR progress lines; dropped from the update log.
 PROGRESS = re.compile(r"frames/s|still running")
+# Episodes per show and update, as `media-asr run --limit` (default 100) did.
+RUN_LIMIT = 100
 
 
 class LibraryError(ValueError):
@@ -220,10 +224,15 @@ class Shell:
         return result.returncode == 0
 
     def stream(
-        self, cmd: list[str], env: dict[str, str], drop: re.Pattern | None = None
+        self,
+        cmd: list[str],
+        env: dict[str, str],
+        drop: re.Pattern | None = None,
+        echo: bool = True,
     ) -> tuple[int, str]:
-        """Print the command's output except lines matching ``drop``; return
-        the exit code and the printed output."""
+        """Run the command and keep its output except lines matching ``drop``,
+        printing them as they come if ``echo``; return the exit code and the
+        kept output."""
         kept = []
         with subprocess.Popen(
             cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
@@ -231,9 +240,68 @@ class Shell:
             for raw in proc.stdout:
                 line = raw.decode("utf-8", "replace")
                 if drop is None or not drop.search(line):
-                    print(line, end="", flush=True)
+                    if echo:
+                        print(line, end="", flush=True)
                     kept.append(line)
         return proc.returncode, "".join(kept)
+
+
+def _minutes(seconds: float) -> str:
+    return f"{int(seconds // 60)}m{int(seconds % 60):02d}s"
+
+
+def transcribe_episodes(queue: list[tuple[sqlite3.Row, str]], env: dict, jobs: int, shell) -> int:
+    """Transcribe and diarize these (episode, language) pairs on the GPU host,
+    ``jobs`` at a time, each in its own ``media-asr-remote run --ids``; return
+    1 if any failed. Jobs take turns on the GPU through the remote workers'
+    lock while the others download. Each episode's output is printed as one
+    block when it ends."""
+    if not queue:
+        log("nothing to do")
+        return 0
+    log(f"{len(queue)} episode(s), up to {jobs} at a time")
+    began, printing = time.monotonic(), threading.Lock()
+
+    def one(number: int, row: sqlite3.Row, language: str) -> bool:
+        tag = f"[{number}/{len(queue)}]"
+        with printing:
+            log(f"{tag} start {row['id']} ({language}) {row['title']}")
+        started = time.monotonic()
+        try:
+            code, out = shell.stream(
+                [
+                    str(REMOTE),
+                    "run",
+                    "--ids",
+                    row["id"],
+                    "--language",
+                    language,
+                    "--diarize",
+                    "--diarization-backend",
+                    "pyannote",
+                ],
+                env,
+                drop=PROGRESS,
+                echo=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - this episode only
+            code, out = 1, f"{exc}\n"
+        took = _minutes(time.monotonic() - started)
+        with printing:
+            result = "done" if code == 0 else f"FAILED (exit {code})"
+            log(f"{tag} {result} in {took}: {row['id']} {row['title']}")
+            print("".join(f"    {line}\n" for line in out.splitlines()), end="", flush=True)
+        return code == 0
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        ok = list(
+            pool.map(lambda args: one(*args), [(n, *pair) for n, pair in enumerate(queue, 1)])
+        )
+    log(
+        f"transcribed {sum(ok)}, failed {len(ok) - sum(ok)}, "
+        f"in {_minutes(time.monotonic() - began)}"
+    )
+    return 0 if all(ok) else 1
 
 
 def update(
@@ -244,43 +312,59 @@ def update(
     fallback_gpu_env: str | None = None,
     latest: int = 5,
     workers: int = 4,
+    jobs: int = 1,
     shell: Shell | None = None,
     sleep=time.sleep,
 ) -> int:
-    """Daily refresh: feeds -> per-show remote GPU transcription with pyannote
-    diarization -> rediarize -> enrich -> correct-terms.
+    """Daily refresh: feeds -> remote GPU transcription with pyannote
+    diarization, ``jobs`` episodes at a time -> rediarize -> enrich ->
+    correct-terms (``workers`` episodes at a time).
 
     The GPU host is ``gpu_env`` if it passes ``remote-check``, else
-    ``fallback_gpu_env`` (else the wrapper's default env file). Every step is
-    idempotent, so a failed run can be re-run as is. Returns 1 if any feed,
-    episode or step failed, after doing all the work it could. One update per
-    library at a time: a second one exits 1 at once.
+    ``fallback_gpu_env`` if that passes, one episode at a time (its workers may
+    have no GPU lock, e.g. on Windows); with neither option, the wrapper's
+    default env file, unchecked. If no given host passes, the GPU steps are
+    skipped. Every step is idempotent, so a failed run can be re-run as is.
+    Returns 1 if any feed, episode or step failed, after doing all the work it
+    could. One update per library at a time: a second one exits 1 at once.
     """
     lock = store.path.parent / ".library-update.lock"
     with file_lock(lock, wait=False) as acquired:
         if not acquired:
             log(f"error: another library-update holds {lock}")
             return 1
-        return _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, shell, sleep)
+        return _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, jobs, shell, sleep)
 
 
-def _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, shell, sleep) -> int:
+def _gpu_host(shell, env, gpu_env, fallback_gpu_env, jobs) -> tuple[bool, int]:
+    """Point ``env`` at the GPU host to use; return (usable, jobs at a time)."""
+    if not gpu_env and not fallback_gpu_env:
+        log(f"gpu: ~/.config/media-asr/remote.env (default), {jobs} episode(s) at a time")
+        return True, jobs
+    for path, at_a_time in ((gpu_env, jobs), (fallback_gpu_env, 1)):
+        if not path:
+            continue
+        if shell.check(
+            [str(REMOTE), "remote-check"], {**env, "MEDIA_ASR_REMOTE_ENV": path}, timeout=90
+        ):
+            env["MEDIA_ASR_REMOTE_ENV"] = path
+            log(f"gpu: {path}, {at_a_time} episode(s) at a time")
+            return True, at_a_time
+        log(f"gpu: {path} failed remote-check")
+    log("error: no GPU host passed remote-check; skipping transcription and rediarize")
+    return False, 0
+
+
+def _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, jobs, shell, sleep) -> int:
     if not REMOTE.exists():
         raise LibraryError(f"library-update needs the source checkout wrapper {REMOTE}")
     shell = shell or Shell()
     status = 0
     log(f"== {now_iso()} start")
     env = dict(os.environ, MEDIA_ASR_DATA=str(DATA_DIR.resolve()), PYTHONUNBUFFERED="1")
-    if gpu_env and shell.check(
-        [str(REMOTE), "remote-check"], {**env, "MEDIA_ASR_REMOTE_ENV": gpu_env}, timeout=90
-    ):
-        env["MEDIA_ASR_REMOTE_ENV"] = gpu_env
-    else:
-        if gpu_env:
-            log(f"gpu: {gpu_env} failed remote-check")
-        if fallback_gpu_env:
-            env["MEDIA_ASR_REMOTE_ENV"] = fallback_gpu_env
-    log(f"gpu: {env.get('MEDIA_ASR_REMOTE_ENV', '~/.config/media-asr/remote.env (default)')}")
+    gpu, jobs = _gpu_host(shell, env, gpu_env, fallback_gpu_env, jobs)
+    if not gpu:
+        status = 1
 
     log("== refresh feeds")
     for attempt in (1, 2, 3):
@@ -294,30 +378,20 @@ def _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, shell, sle
             sleep(attempt * 30)
 
     log("== transcribe")
-    subscribed = [row["url"] for row in store.list_feeds()]
+    queue, subscribed = [], [row["url"] for row in store.list_feeds()]
+    waiting = store.list_items(retry_failed=True, limit=1_000_000)  # oldest first
     for show in shows:
         if not any(show.matches(url) for url in subscribed):
             log(f"WARN: {show.name or show.feed} is not subscribed: media-asr add {show.feed}")
             status = 1
             continue
-        code, _ = shell.stream(
-            [
-                str(REMOTE),
-                "run",
-                "--retry-failed",
-                "--feed-contains",
-                show.feed,
-                "--language",
-                show.language,
-                "--diarize",
-                "--diarization-backend",
-                "pyannote",
-            ],
-            env,
-            drop=PROGRESS,
-        )
-        if code:
-            status = 1
+        queued = {row["id"] for row, _ in queue}
+        mine = [row for row in waiting if show.matches(row["feed_url"]) and row["id"] not in queued]
+        queue += [(row, show.language) for row in mine[:RUN_LIMIT]]
+    if not gpu:
+        log(f"skipped: no GPU host ({len(queue)} episode(s) waiting)")
+    elif transcribe_episodes(queue, env, jobs, shell):
+        status = 1
     failed = store.list_items(status="failed", limit=1000)
     if failed:
         log("FAILED episodes:")
@@ -329,7 +403,7 @@ def _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, shell, sle
         # Through the wrapper: rediarize re-runs episodes on the GPU in-process.
         (
             "re-diarize episodes where one label merged several people",
-            [str(REMOTE), "rediarize"],
+            [str(REMOTE), "rediarize", "--workers", str(workers)] if gpu else None,
             PROGRESS,
         ),
         ("punctuation + speaker names", [*MEDIA_ASR, "enrich", "--workers", str(workers)], None),
@@ -340,6 +414,9 @@ def _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, shell, sle
         ),
     ):
         log(f"== {title}")
+        if cmd is None:
+            log("skipped: no GPU host")
+            continue
         code, _ = shell.stream(cmd, env, drop=drop)
         if code:
             status = 1
