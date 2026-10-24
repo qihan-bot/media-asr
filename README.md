@@ -252,8 +252,8 @@ hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # optional
 
 | Command | Purpose |
 | --- | --- |
-| `library-update` | The daily pipeline: `refresh --latest 5` (retried up to 3 times) → for each show `run --retry-failed --feed-contains <feed> --language <language> --diarize --diarization-backend pyannote` through `media-asr-remote` → `rediarize` → `enrich` → `correct-terms` → `stats`. Exits 1 if any feed, episode or step failed, after doing all the work it could; every step is idempotent, so a failed run can be re-run as is (`--latest`, `--workers`) |
-| `rediarize` | When one speaker label holds more than 75% of the speaking time (`--share`), DeepSeek checks whether it merges several people; hard merges (over 90%) and episodes with 3+ people are transcribed again on the GPU with that many speakers plus one (`--dry-run`, `--shard i/n`) |
+| `library-update` | The daily pipeline: `refresh --latest 5` (retried up to 3 times) → for each show `run --retry-failed --feed-contains <feed> --language <language> --diarize --diarization-backend pyannote` through `media-asr-remote` → `media-asr-remote rediarize` → `enrich` → `correct-terms` → `stats`. Exits 1 if any feed, episode or step failed, after doing all the work it could; every step is idempotent, so a failed run can be re-run as is (`--latest`, `--workers`) |
+| `rediarize` | When one speaker label holds more than 75% of the speaking time (`--share`), DeepSeek checks whether it merges several people; hard merges (over 90%) and episodes with 3+ people are transcribed again on the GPU with that many speakers plus one. The check, the re-run and the marker of an episode happen under one hold of its lock, in this process, so run it as `media-asr-remote rediarize` to reach the GPU host (`--dry-run`, `--shard i/n`) |
 | `enrich` | Punctuation and speaker names (`--ids`, `--force`, `--limit`, `--workers`, `--chunk-workers`) |
 | `correct-terms` | Audited correction of misheard names and terms (`--ids`, `--force`, `--workers`) |
 

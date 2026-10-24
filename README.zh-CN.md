@@ -234,8 +234,8 @@ hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # 可选
 
 | 命令 | 用途 |
 | --- | --- |
-| `library-update` | 每日流程：`refresh --latest 5`（失败最多重试 3 次）→ 每档节目通过 `media-asr-remote` 执行 `run --retry-failed --feed-contains <feed> --language <language> --diarize --diarization-backend pyannote` → `rediarize` → `enrich` → `correct-terms` → `stats`。任何 feed、单期或步骤失败时，做完能做的部分后以 1 退出；每一步都幂等，失败后可原样重跑（`--latest`、`--workers`） |
-| `rediarize` | 某个说话人标签占说话时长超过 75%（`--share`）时，由 DeepSeek 判断是否混入了多人；严重合并（超过 90%）或 3 人以上的节目，在 GPU 上按“人数 + 1”重新转写分离（`--dry-run`、`--shard i/n`） |
+| `library-update` | 每日流程：`refresh --latest 5`（失败最多重试 3 次）→ 每档节目通过 `media-asr-remote` 执行 `run --retry-failed --feed-contains <feed> --language <language> --diarize --diarization-backend pyannote` → `media-asr-remote rediarize` → `enrich` → `correct-terms` → `stats`。任何 feed、单期或步骤失败时，做完能做的部分后以 1 退出；每一步都幂等，失败后可原样重跑（`--latest`、`--workers`） |
+| `rediarize` | 某个说话人标签占说话时长超过 75%（`--share`）时，由 DeepSeek 判断是否混入了多人；严重合并（超过 90%）或 3 人以上的节目，在 GPU 上按“人数 + 1”重新转写分离。同一期的检查、重跑和完成标记都在这个进程里、持有同一把锁完成，所以要用 `media-asr-remote rediarize` 运行以连上 GPU 主机（`--dry-run`、`--shard i/n`） |
 | `enrich` | 补标点、识别说话人姓名（`--ids`、`--force`、`--limit`、`--workers`、`--chunk-workers`） |
 | `correct-terms` | 可审计的人名 / 术语纠错（`--ids`、`--force`、`--workers`） |
 

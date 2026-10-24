@@ -325,16 +325,22 @@ def _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, shell, sle
             log(f"{row['id']}  {row['title']}")
         status = 1
 
-    for title, step in (
-        ("re-diarize episodes where one label merged several people", ["rediarize"]),
-        ("punctuation + speaker names", ["enrich", "--workers", str(workers)]),
+    for title, cmd, drop in (
+        # Through the wrapper: rediarize re-runs episodes on the GPU in-process.
+        (
+            "re-diarize episodes where one label merged several people",
+            [str(REMOTE), "rediarize"],
+            PROGRESS,
+        ),
+        ("punctuation + speaker names", [*MEDIA_ASR, "enrich", "--workers", str(workers)], None),
         (
             "term correction (audited replacement pairs, see terms.json)",
-            ["correct-terms", "--workers", str(workers)],
+            [*MEDIA_ASR, "correct-terms", "--workers", str(workers)],
+            None,
         ),
     ):
         log(f"== {title}")
-        code, _ = shell.stream([*MEDIA_ASR, *step], env)
+        code, _ = shell.stream(cmd, env, drop=drop)
         if code:
             status = 1
 

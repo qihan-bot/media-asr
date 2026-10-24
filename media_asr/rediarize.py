@@ -11,26 +11,27 @@ episode. Merged items whose largest label holds over 90% of the time, or with
 can still merge host and guest, e.g. 硅谷101 E247),
 their ``enrich.json`` is removed so ``enrich`` names them again,
 and ``rediarize.json`` records the decision so no item is checked twice.
-Before it re-runs or marks an episode, the step holds the item's lock and
-checks that the transcript the model judged is still the episode's transcript
-and that no other run has decided meanwhile. The re-run itself goes through
-``media-asr run``, which takes the lock; afterwards the marker is written only
-if no other run has changed the episode since.
 
-``media-asr rediarize`` needs ``DEEPSEEK_API_KEY`` and ``HF_TOKEN``; the GPU host
-comes from ``MEDIA_ASR_REMOTE_ENV`` as for ``media-asr-remote``.
+Check, re-run and marker happen under one hold of the item's lock: the verdict
+is acted on only if the transcript the model judged is still the episode's
+transcript and no other run has decided meanwhile; the re-run happens in this
+process, and the marker records the transcript that re-run wrote. No other run
+can write the episode until the marker is down.
+
+Run it as ``media-asr-remote rediarize`` (``library-update`` does) so the
+re-runs reach the GPU host of ``MEDIA_ASR_REMOTE_ENV``; it needs
+``DEEPSEEK_API_KEY`` and ``HF_TOKEN``.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-import subprocess
 from collections import Counter
 from pathlib import Path
 
 from .config import ITEMS_DIR
-from .library import REMOTE, ROOT, file_digest, read_json
+from .library import file_digest, read_json
 from .llm import LLM
 from .util import atomic_write, item_lock, now_iso
 
@@ -86,24 +87,6 @@ def build_prompt(title: str, segments: list[dict], shares: Counter) -> tuple[str
     return label, text
 
 
-def rerun_remote(item_id: str, language: str, num_speakers: int) -> subprocess.CompletedProcess:
-    """Transcribe and diarize one item again on the remote GPU."""
-    cmd = [
-        str(REMOTE),
-        "run",
-        "--ids",
-        item_id,
-        "--language",
-        language,
-        "--diarize",
-        "--diarization-backend",
-        "pyannote",
-        "--num-speakers",
-        str(num_speakers),
-    ]
-    return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-
-
 def parse_verdict(verdict) -> tuple[bool, int]:
     """(merged, people) from the model's answer; ValueError if it is malformed:
     merged must be true or false, people a whole number of at least 1."""
@@ -152,38 +135,32 @@ def check(row, llm: LLM, *, share: float, dry_run: bool, items_dir: Path, rerun)
     # interview is normal); it only helped hard merges and 3+ people.
     rediarize = merged and people >= 2 and (before > 0.9 or people >= 3)
     with item_lock(item_dir):
-        # The verdict is about the transcript read above: act on it only if that
-        # is still the episode's transcript and no other run decided meanwhile.
+        # One hold of the lock from the check to the marker: the verdict is acted
+        # on only while its transcript is current, and no other run can write the
+        # episode before the marker records what this run did.
         if marker.exists():
-            return True
+            return True  # another run decided meanwhile
         if file_digest(transcript) != digest:
             print(f"FAIL check {row['id']}: transcript.json changed meanwhile", flush=True)
             return False
-        if not rediarize:
-            atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
-            return True
-    # The re-run is not under the item's lock: `run` takes it, and drops the
-    # later steps' markers before it writes the new transcript.
-    lang = "zh" if (row["language"] or "").startswith("zh") else "en"
-    result = rerun(row["id"], lang, people + 1)
-    if result.returncode != 0:
-        print(
-            f"FAIL rerun {row['id']}: {result.stdout[-300:]} {result.stderr[-300:]}",
-            flush=True,
-        )
-        return False
-    produced = file_digest(transcript)
-    with item_lock(item_dir):
-        if marker.exists() or file_digest(transcript) != produced:
-            # Another run changed the episode after the re-run; its state wins,
-            # and an unmarked episode is checked again on the next run.
-            print(f"       rerun: done; {row['id']} changed again since, not marked", flush=True)
-            return True
-        after = label_shares(read_json(transcript)[0]["segments"]).most_common(1)[0][1]
-        record["share_after"] = round(after, 3)
-        (item_dir / "enrich.json").unlink(missing_ok=True)
+        if rediarize:
+            if rerun is None:
+                raise RuntimeError("no re-run configured; use media-asr-remote rediarize")
+            lang = "zh" if (row["language"] or "").startswith("zh") else "en"
+            try:
+                produced = rerun(row["id"], lang, people + 1)
+            except Exception as exc:  # noqa: BLE001 - left unmarked, retried next run
+                print(f"FAIL rerun {row['id']}: {exc}", flush=True)
+                return False
+            new, current = read_json(transcript)
+            if current != produced:
+                raise RuntimeError("transcript.json is not the output of the re-run")
+            after = label_shares(new["segments"]).most_common(1)[0][1]
+            record["share_after"] = round(after, 3)
+            (item_dir / "enrich.json").unlink(missing_ok=True)
         atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
-    print(f"       rerun: largest label {before:.0%} -> {after:.0%}", flush=True)
+    if rediarize:
+        print(f"       rerun: largest label {before:.0%} -> {after:.0%}", flush=True)
     return True
 
 
@@ -195,12 +172,15 @@ def run(
     dry_run: bool = False,
     shard: str = "0/1",
     items_dir: Path = ITEMS_DIR,
-    rerun=rerun_remote,
+    rerun=None,
 ) -> int:
     """Check and redo merged episodes; return 1 if any episode failed.
 
-    A failure (bad transcript, malformed verdict, failed re-run) affects only
-    its episode, which stays unmarked and is checked again on the next run.
+    ``rerun(item_id, language, num_speakers)`` transcribes an episode again
+    while this step holds its lock and returns the SHA-256 of the
+    transcript.json it wrote (``media-asr rediarize`` passes the remote GPU
+    run). A failure (bad transcript, malformed verdict, failed re-run) affects
+    only its episode, which stays unmarked and is checked again on the next run.
     """
     index, shards = (int(x) for x in shard.split("/"))
     rows = db.execute("SELECT * FROM items WHERE status = 'done' ORDER BY published_at").fetchall()

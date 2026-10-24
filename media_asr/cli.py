@@ -21,7 +21,7 @@ from .config import (
 )
 from .db import Store
 from .fetch import download, normalize_audio, resolve_source
-from .library import STEP_MARKERS
+from .library import STEP_MARKERS, file_digest
 from .remote import RemoteGPU
 from .render import render_all
 from .summarize import available_engines, summarize
@@ -924,10 +924,53 @@ def cmd_rediarize(store: Store, args: argparse.Namespace) -> int:
     key = _deepseek_key()
     if not key:
         return 1
+
+    def rerun(item_id: str, language: str, num_speakers: int) -> str:
+        return _rerun_item(store, item_id, language, num_speakers)
+
     with LLM(key) as llm:
         return rediarize.run(
-            store.conn, llm, share=args.share, dry_run=args.dry_run, shard=args.shard
+            store.conn, llm, share=args.share, dry_run=args.dry_run, shard=args.shard, rerun=rerun
         )
+
+
+def _rerun_item(store: Store, item_id: str, language: str, num_speakers: int) -> str:
+    """Transcribe and diarize one item again on the remote GPU (pyannote).
+
+    For rediarize, which holds the item's lock (so this does not take it) and
+    needs the remote settings in the environment (media-asr-remote). Returns
+    the SHA-256 of the transcript.json it wrote; raises if the run failed.
+    """
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--backend",
+            "remote",
+            "--remote-mode",
+            "full",
+            "--language",
+            language,
+            "--diarize",
+            "--diarization-backend",
+            "pyannote",
+            "--num-speakers",
+            str(num_speakers),
+        ]
+    )
+    row = store.get_item(item_id)
+    if row is None:
+        raise RuntimeError(f"not found: {item_id}")
+    remote = RemoteGPU.from_args(args)
+    if not remote.host:
+        raise RuntimeError("no remote GPU configured; run it as media-asr-remote rediarize")
+    _log(f"\n== {item_id}  {row['title']}")
+    remote.connect()
+    try:
+        if not _process_item(store, dict(row), None, args, remote=remote):
+            raise RuntimeError("transcription failed (see above)")
+    finally:
+        remote.close()
+    return file_digest(ITEMS_DIR / item_id / "transcript.json")
 
 
 def cmd_library_update(store: Store, args: argparse.Namespace) -> int:

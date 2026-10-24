@@ -33,7 +33,9 @@ Podcast library: the process scripts became package modules and subcommands.
   checking that its input has not changed and after removing its markers, so an
   interrupted write is redone; `run` removes the later steps' markers before it
   writes a new transcript; one `library-update` per library at a time;
-  `rediarize` keeps going when one episode fails.
+  `rediarize` checks, re-runs (in-process; run it as `media-asr-remote rediarize`)
+  and marks an episode under one hold of its lock, and keeps going when one
+  episode fails.
 - `run --feed-contains` limits a run to one feed, `run --ids` processes exactly
   the given items; the same title in the same feed is the same episode (an
   episode not yet transcribed takes the feed's current download URL); direct

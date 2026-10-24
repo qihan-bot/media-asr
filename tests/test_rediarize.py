@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -10,8 +12,10 @@ from media_asr import cli
 from media_asr import enrich as E
 from media_asr import rediarize as R
 from media_asr.db import Segment, Store
+from media_asr.library import file_digest
 from media_asr.render import render_all
 from media_asr.transcribe import TranscriptSegment
+from media_asr.util import file_lock, item_lock
 
 # title -> (largest label share, model verdict)
 EPISODES = {
@@ -72,7 +76,7 @@ def test_rediarize_reruns_hard_merges_and_three_people(tmp_path: Path) -> None:
         reruns.append((item_id, language, num_speakers))
         transcript = items_dir / item_id / "transcript.json"
         transcript.write_text(json.dumps({"segments": segments(0.55)}))
-        return subprocess.CompletedProcess([], 0, "", "")
+        return file_digest(transcript)
 
     llm = FakeLLM()
     assert R.run(store.conn, llm, items_dir=items_dir, rerun=rerun) == 0
@@ -99,7 +103,7 @@ def test_rediarize_failed_rerun_and_dry_run_leave_no_marker(tmp_path: Path) -> N
     store, items_dir, ids = make_library(tmp_path)
 
     def broken(item_id: str, language: str, num_speakers: int):
-        return subprocess.CompletedProcess([], 1, "", "ssh: connect failed")
+        raise RuntimeError("ssh: connect failed")
 
     assert R.run(store.conn, FakeLLM(), items_dir=items_dir, dry_run=True, rerun=broken) == 0
     assert not list(items_dir.glob("*/rediarize.json"))
@@ -192,11 +196,8 @@ def test_a_new_transcript_makes_later_steps_run_again(tmp_path: Path, monkeypatc
     monkeypatch.setattr(cli.RemoteGPU, "from_args", lambda args: remote)
     parser = cli.build_parser()
 
-    def rerun(item_id: str, language: str, num_speakers: int):
-        args = parser.parse_args(
-            ["run", "--ids", item_id, "--backend", "remote", "--remote-mode", "full", "--diarize"]
-        )
-        return subprocess.CompletedProcess([], cli.cmd_run(store, args, item_ids=args.ids), "", "")
+    def rerun(item_id: str, language: str, num_speakers: int) -> str:
+        return cli._rerun_item(store, item_id, language, num_speakers)
 
     class Merged:
         def chat(self, *args) -> dict:
@@ -266,6 +267,11 @@ def test_one_bad_episode_does_not_stop_the_others(tmp_path: Path, capsys) -> Non
     store.close()
 
 
+def label_share(transcript: Path) -> float:
+    """Largest label's share of a transcript.json."""
+    return R.label_shares(json.loads(transcript.read_text())["segments"]).most_common(1)[0][1]
+
+
 def one_episode(tmp_path: Path, share: float = 0.95) -> tuple[Store, Path, str]:
     store = Store(tmp_path / "media.db")
     items_dir = tmp_path / "items"
@@ -322,38 +328,95 @@ def test_no_rerun_when_another_run_decided_meanwhile(tmp_path: Path) -> None:
     store.close()
 
 
-def test_newer_state_after_the_rerun_is_kept(tmp_path: Path, monkeypatch) -> None:
+def rerun_episode(tmp_path: Path, monkeypatch, remote: FakeRemote):
+    """An episode that needs a re-run, and the real in-process re-run on ``remote``."""
     store, items_dir, item = one_episode(tmp_path)
-    item_dir = items_dir / item
-    marker = item_dir / "rediarize.json"
+    monkeypatch.setattr(cli, "ITEMS_DIR", items_dir)
+    monkeypatch.setattr(cli.RemoteGPU, "from_args", lambda args: remote)
 
-    def rerun(item_id: str, language: str, num_speakers: int):
-        (item_dir / "transcript.json").write_text(json.dumps({"segments": segments(0.6)}))
-        marker.write_text('{"by": "other run"}')  # another run checked the new transcript
-        return subprocess.CompletedProcess([], 0, "", "")
+    def rerun(item_id: str, language: str, num_speakers: int) -> str:
+        return cli._rerun_item(store, item_id, language, num_speakers)
 
-    assert R.run(store.conn, Verdict(HARD_MERGE), items_dir=items_dir, rerun=rerun) == 0
+    return store, items_dir / item, rerun
+
+
+def test_no_other_run_gets_in_between_check_and_rerun(tmp_path: Path, monkeypatch) -> None:
+    # Review r3, before_rerun: another run takes the episode right after the
+    # check; the stale verdict then re-ran and overwrote its newer transcript.
+    events: list[str] = []
+
+    class Remote(FakeRemote):
+        def run_full(self, item, item_dir, **kwargs):
+            events.append(f"rerun with {kwargs['num_speakers']} speakers")
+            return super().run_full(item, item_dir, **kwargs)
+
+    store, item_dir, rerun = rerun_episode(tmp_path, monkeypatch, Remote(fail=False))
+    marker, transcript = item_dir / "rediarize.json", item_dir / "transcript.json"
+    seen: dict = {}
+
+    def another_run() -> None:
+        with item_lock(item_dir):  # every writer honors the item lock
+            seen["marker"] = json.loads(marker.read_text())
+            events.append("other run")
+            transcript.write_text(json.dumps({"segments": segments(0.3)}))
+            marker.write_text('{"by": "other run"}')
+
+    other = threading.Thread(target=another_run)
+    real_lock = R.item_lock
+
+    @contextmanager
+    def lock_then_other_run(path: Path):
+        with real_lock(path) as held:
+            other.start()  # wants the episode now, right after the check
+            yield held
+
+    monkeypatch.setattr(R, "item_lock", lock_then_other_run)
+    assert R.run(store.conn, Verdict(HARD_MERGE), items_dir=item_dir.parent, rerun=rerun) == 0
+    other.join(5)
+    assert events == ["rerun with 3 speakers", "other run"]
+    # It got the episode only after this run's marker, and its newer state stands.
+    assert seen["marker"]["share_after"] == 0.5
     assert json.loads(marker.read_text()) == {"by": "other run"}
+    assert label_share(transcript) == 0.7
+    store.close()
 
-    # Another run re-transcribes between the re-run and the marker: no marker.
-    marker.unlink()
-    (item_dir / "transcript.json").write_text(json.dumps({"segments": segments(0.95)}))
 
-    def rerun_only(item_id: str, language: str, num_speakers: int):
-        (item_dir / "transcript.json").write_text(json.dumps({"segments": segments(0.6)}))
-        return subprocess.CompletedProcess([], 0, "", "")
+def test_marker_records_the_transcript_this_rerun_wrote(tmp_path: Path, monkeypatch) -> None:
+    # Review r3, after_rerun: another run wrote a newer transcript and
+    # enrich.json after the re-run; its share was recorded as the re-run's and
+    # its enrich.json deleted.
+    def another_run() -> None:
+        with item_lock(item_dir):
+            transcript.write_text(json.dumps({"segments": segments(0.99)}))
+            (item_dir / "enrich.json").write_text('{"by": "other run"}')
 
-    real_lock, entries = R.item_lock, []
+    other = threading.Thread(target=another_run)
 
-    def lock(path: Path):
-        entries.append(path)
-        if len(entries) == 2:  # the lock after the re-run
-            (item_dir / "transcript.json").write_text(json.dumps({"segments": segments(0.7)}))
-        return real_lock(path)
+    class Remote(FakeRemote):
+        def run_full(self, item, item_dir, **kwargs):
+            with file_lock(item_dir / ".lock", wait=False) as free:
+                assert not free  # the re-run holds the episode's lock
+            output = super().run_full(item, item_dir, **kwargs)
+            other.start()  # wants the episode right after the re-run's output
+            time.sleep(0.2)
+            return output
 
-    monkeypatch.setattr(R, "item_lock", lock)
-    assert R.run(store.conn, Verdict(HARD_MERGE), items_dir=items_dir, rerun=rerun_only) == 0
-    assert len(entries) == 2 and not marker.exists()
+    store, item_dir, rerun = rerun_episode(tmp_path, monkeypatch, Remote(fail=False))
+    transcript = item_dir / "transcript.json"
+    assert R.run(store.conn, Verdict(HARD_MERGE), items_dir=item_dir.parent, rerun=rerun) == 0
+    other.join(5)
+    record = json.loads((item_dir / "rediarize.json").read_text())
+    assert record["share_before"] == 0.95 and record["share_after"] == 0.5
+    assert json.loads((item_dir / "enrich.json").read_text()) == {"by": "other run"}
+    assert label_share(transcript) == 0.99
+    store.close()
+
+
+def test_rerun_needs_a_configured_gpu(tmp_path: Path, monkeypatch) -> None:
+    store, items_dir, item = one_episode(tmp_path)
+    monkeypatch.delenv("MEDIA_ASR_REMOTE_HOST", raising=False)
+    with pytest.raises(RuntimeError, match="media-asr-remote rediarize"):
+        cli._rerun_item(store, item, "en", 3)
     store.close()
 
 
