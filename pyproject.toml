@@ -1,6 +1,6 @@
 [project]
 name = "media-asr"
-version = "0.01"
+version = "0.0.2"
 description = "Local-first speech-to-text for videos and podcasts"
 readme = "README.md"
 license = { text = "MIT" }

@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**版本 0.01** — 本地优先的视频 / 播客语音转文字工具。
+**版本 0.0.2** — 本地优先的视频 / 播客语音转文字工具。
 
 `media-asr` 支持视频链接、播客 RSS、本地音视频文件，输出带时间戳的
 Markdown、SRT、TXT、JSON，并把每个片段写入 SQLite FTS5，支持全文检索。
@@ -20,6 +20,7 @@ Markdown、SRT、TXT、JSON，并把每个片段写入 SQLite FTS5，支持全�
 - 说话人分离：`sherpa-onnx`（全离线）或 `pyannote.audio`（需要 HF 授权）。
 - 中文字幕默认转简体，`--traditional` 保留原脚本。
 - 可选摘要：Antigravity (`agy`) 或 DeepSeek API。
+- 播客库：每天更新多档节目，补标点、识别说话人姓名，并对听错的人名和术语做可审计的纠错。
 - Linux / Windows 都可运行；本地转写不需要任何云端账号。
 
 ## 环境要求
@@ -43,6 +44,7 @@ python3 -m pip install -e .
 
 ```bash
 python3 -m pip install feedparser zhconv paramiko
+python3 -m pip install -e '.[library]'   # 播客库术语纠错
 ```
 
 ## 快速开始
@@ -85,6 +87,10 @@ python3 -m pip install feedparser zhconv paramiko
 | `feeds` | 列出订阅的 RSS |
 | `stats` | 统计条目、小时数、片段数、订阅数 |
 | `remove <id>` | 删除条目及其文件（`--yes`） |
+| `library-update` | 播客库：刷新、转写、重新分离、补标点与姓名、术语纠错 |
+| `rediarize` | 播客库：最大说话人标签混入多人的节目重新分离 |
+| `enrich` | 播客库：补标点、识别说话人姓名 |
+| `correct-terms` | 播客库：可审计的人名 / 术语纠错 |
 
 常用参数：
 
@@ -196,6 +202,82 @@ HF_TOKEN=... ./media-asr run --backend remote --remote-mode full \
 pyannote 3.1 分离约 100 秒，能干净地分出 5 人；sherpa 约 250 秒，会把相近
 男声拆分或合并。
 
+## 播客库
+
+播客库是一个数据目录，里面跟踪多档节目（可以是不同语言），持续完成转写、
+说话人分离、补标点、说话人姓名识别，以及听错的人名和术语纠错。它需要远程
+GPU 后端（pyannote）、DeepSeek API（`DEEPSEEK_API_KEY`）和 `library` 额外依赖：
+
+```bash
+python3 -m pip install -e '.[library]'          # wordfreq、jieba、pypinyin
+export MEDIA_ASR_DATA=~/podcasts
+./media-asr add 'https://feeds.fireside.fm/sv101/rss' --latest 20     # 每档节目订阅一次
+cp docs/examples/podcast-library.toml "$MEDIA_ASR_DATA/library.toml"  # 再按需修改
+HF_TOKEN=... DEEPSEEK_API_KEY=... ./media-asr library-update \
+  --gpu-env ~/.config/media-asr/gpu-a.env --fallback-gpu-env ~/.config/media-asr/remote.env
+```
+
+`$MEDIA_ASR_DATA/library.toml` 列出节目，每档一个 `[[show]]` 表（完整示例见
+[docs/examples/podcast-library.toml](docs/examples/podcast-library.toml)）：
+
+```toml
+[[show]]
+name = "Latent Space"                               # 可选，用于日志
+feed = "https://api.substack.com/feed/podcast/1084089.rss"
+language = "en"                                     # zh 或 en
+hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # 可选
+```
+
+- `feed`：用 `add` 订阅时的 RSS 地址；节目条目的 feed 地址包含这段文字即归入该节目。
+- `language`：Whisper 转写语言，同时决定补标点用的提示词。
+- `hosts`：很少在节目里报自己名字的常驻主持人，作为说话人识别的背景信息。
+
+| 命令 | 用途 |
+| --- | --- |
+| `library-update` | 每日流程：`refresh --latest 5`（失败最多重试 3 次）→ 每档节目通过 `media-asr-remote` 执行 `run --retry-failed --feed-contains <feed> --language <language> --diarize --diarization-backend pyannote` → `rediarize` → `enrich` → `correct-terms` → `stats`。任何 feed、单期或步骤失败时，做完能做的部分后以 1 退出；每一步都幂等，失败后可原样重跑（`--latest`、`--workers`） |
+| `rediarize` | 某个说话人标签占说话时长超过 75%（`--share`）时，由 DeepSeek 判断是否混入了多人；严重合并（超过 90%）或 3 人以上的节目，在 GPU 上按“人数 + 1”重新转写分离（`--dry-run`、`--shard i/n`） |
+| `enrich` | 补标点、识别说话人姓名（`--ids`、`--force`、`--limit`、`--workers`、`--chunk-workers`） |
+| `correct-terms` | 可审计的人名 / 术语纠错（`--ids`、`--force`、`--workers`） |
+
+`library-update` 按 `media-asr-remote` 的 env 文件选择 GPU 主机：`--gpu-env`
+（`MEDIA_ASR_GPU_ENV`）在 90 秒内通过 `remote-check` 就用它，否则用
+`--fallback-gpu-env`（`MEDIA_ASR_FALLBACK_GPU_ENV`；默认 `MEDIA_ASR_REMOTE_ENV`
+或 `~/.config/media-asr/remote.env`）。它调用源码目录里的 `media-asr-remote`
+包装脚本，所以要在克隆的仓库里运行。所有 DeepSeek 步骤使用
+`MEDIA_ASR_LLM_MODEL`（默认 `deepseek-flash`）。
+
+每期节目的文件：
+
+```text
+items/<id>/
+  transcript.*         # 转写 + 说话人分离（SPEAKER_00 标签）；只有 rediarize 会重写
+  rediarize.json       # 合并检查：标签、前后占比、判断结果
+  transcript_named.*   # 补标点、标姓名、术语纠错后的文稿；检索索引指向它
+  named_base.json      # 术语纠错前的补标点、标姓名片段
+  enrich.json          # 补标点的片段数、每个说话人姓名及依据
+  terms.json           # 采用的替换对（层级、次数）和被拒绝的替换对（原因）
+```
+
+`rediarize.json`、`enrich.json`、`terms.json` 是完成标记：每一步跳过已有自己
+标记的条目。`rediarize` 会删除重做节目的 `enrich.json`，`enrich` 会删除
+`terms.json`，后续步骤因此会重新执行。
+
+审计与回滚：
+
+- 补标点逐段校验，只有字母和数字完全不变时才采用，所以不会改动说过的话。
+- 说话人姓名只采用高 / 中置信度的结果；其余标签写成 `主持人N`、`嘉宾N`、
+  `说话人N`（英文节目为 `Host N`、`Guest N`、`Speaker N`）。
+- 术语纠错时模型不改写文稿，只提出 `wrong -> right` 替换对。一个替换对要同时
+  听起来像误听（中文两边字数相同，且每对汉字的无声调拼音相似度不低于 0.4；
+  英文拼写相似度不低于 0.55，短词 0.65；错误写法不是常用词），并且有依据：
+  `reference` 层级（正确写法出现在节目简介、其他期标题或说话人姓名里），或
+  `model` 层级（模型高置信度认定的知名名词），才会按字面替换。`terms.json`
+  记录每个替换对的层级和次数，以及每个被拒绝的替换对和原因。
+- 每一步都保留输入：`enrich` 读取原始的 `transcript.json`，`correct-terms`
+  总是从 `named_base.json` 开始，纠错不会叠加。`correct-terms --ids <id> --force`
+  重建纠错后的文稿（例如规则修改之后）；`enrich --ids <id> --force` 从原始转写
+  重建全部结果并删除 `terms.json`，下次运行时会重新纠错。
+
 ## 输出结构
 
 ```text
@@ -238,7 +320,12 @@ data/
 | `MEDIA_ASR_REMOTE_MODE` | `asr` 或 `full` |
 | `MEDIA_ASR_REMOTE_PASSWORD` | SSH 密码（优先用 key 或密钥管理） |
 | `MEDIA_ASR_REMOTE_SECRET` | 包装脚本使用的可选 Vault 引用 |
+| `MEDIA_ASR_REMOTE_ENV` | `media-asr-remote` 读取的 env 文件（默认 `~/.config/media-asr/remote.env`） |
 | `HF_TOKEN` | pyannote 模型所需的 HuggingFace token |
+| `DEEPSEEK_API_KEY` | DeepSeek API key（摘要、播客库） |
+| `MEDIA_ASR_LLM_MODEL` | 播客库各步骤使用的 DeepSeek 模型（默认 `deepseek-flash`） |
+| `MEDIA_ASR_GPU_ENV` | `library-update`：首选 GPU 主机的 env 文件 |
+| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`：备用 GPU 主机的 env 文件 |
 
 ## 性能参考
 
@@ -259,7 +346,8 @@ data/
 
 - `small` 快，但人名、数字、中英混合术语容易错；可用 `--prompt`、`medium`
   或远程 GPU 提升。
-- 不做翻译、章节切分、说话人姓名识别。
+- 不做翻译、章节切分。说话人姓名只在播客库的 `enrich` 步骤里识别（DeepSeek
+  阅读节目简介和文稿）。
 - pyannote 需要 gated HuggingFace 模型和 token。
 - OpenAI Whisper 可能跳过短段落，或在结尾幻觉出“字幕志愿者 / 点赞订阅”等
   文本；远端 worker 会过滤常见结尾，但不能保证完美。
@@ -278,10 +366,13 @@ python3 -m ruff check .
 目录结构：
 
 ```text
-media_asr/          CLI、抓取、ASR、数据库、渲染、远程客户端
-scripts/            远端 worker、OpenAI Whisper 辅助脚本、对比工具
+media_asr/          CLI、抓取、ASR、数据库、渲染、远程客户端，
+                    播客库（library、llm、enrich、terms、rediarize）
+scripts/            远端 worker、OpenAI Whisper 辅助脚本、对比工具、
+                    All-In 说话人工具、每日任务包装脚本
 tests/              离线单元测试
 docs/remote-gpu.md  远程 GPU 安装与基准
+docs/examples/      播客库配置示例
 ```
 
 ## 许可证

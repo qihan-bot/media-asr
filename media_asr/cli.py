@@ -9,6 +9,7 @@ import time
 import traceback
 from pathlib import Path
 
+from . import __version__
 from .config import (
     DATA_DIR,
     DEFAULT_COMPUTE,
@@ -134,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="media-asr",
         description="Local speech-to-text pipeline for videos and podcasts.",
     )
-    parser.add_argument("--version", action="version", version="media-asr 0.01")
+    parser.add_argument("--version", action="version", version=f"media-asr {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     add = sub.add_parser("add", parents=[run_parent], help="add a URL, feed, or local file")

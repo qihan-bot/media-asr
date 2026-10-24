@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**Version 0.01** — local-first speech-to-text for videos and podcasts.
+**Version 0.0.2** — local-first speech-to-text for videos and podcasts.
 
 `media-asr` turns a video URL, podcast RSS feed, or local media file into a
 searchable transcript. Transcription runs locally with
@@ -27,6 +27,8 @@ modules, and optional remote-worker scripts.
 - Word-level timestamps and speaker turn alignment when diarization is enabled.
 - Markdown / SRT / TXT / JSON transcripts and SQLite FTS5 search.
 - Optional summaries with Antigravity (`agy`) or the DeepSeek API.
+- Podcast library: a daily update of several shows with speaker names,
+  punctuation, and audited correction of misheard names and terms.
 - Chinese output is normalized to Simplified Chinese by default
   (`--traditional` keeps the original script).
 - Runs on Linux and Windows; no cloud account is required for local ASR.
@@ -53,6 +55,7 @@ Optional extras used by some features:
 
 ```bash
 python3 -m pip install feedparser zhconv paramiko
+python3 -m pip install -e '.[library]'   # podcast library term correction
 ```
 
 ## Quick start
@@ -96,6 +99,10 @@ python3 -m pip install feedparser zhconv paramiko
 | `feeds` | List subscribed feeds |
 | `stats` | Counts, transcribed hours, segments, feeds |
 | `remove <id>` | Delete an item and its files (`--yes`) |
+| `library-update` | Podcast library: refresh, transcribe, rediarize, enrich, correct terms |
+| `rediarize` | Podcast library: redo episodes whose largest speaker label merged several people |
+| `enrich` | Podcast library: punctuation and speaker names |
+| `correct-terms` | Podcast library: audited correction of misheard names and terms |
 
 Useful run options:
 
@@ -209,6 +216,92 @@ the first turns. On a 94-minute, 5-speaker episode, pyannote 3.1 took about
 100 s for diarization and produced a clean five-way split; sherpa took about
 250 s and split/merged several voices.
 
+## Podcast library
+
+A podcast library is a data directory that follows several shows, possibly in
+different languages, and keeps them transcribed, diarized and punctuated, with
+speakers named and misheard names and terms corrected. It uses the remote GPU
+backend with pyannote, the DeepSeek API (`DEEPSEEK_API_KEY`), and the `library`
+extras:
+
+```bash
+python3 -m pip install -e '.[library]'          # wordfreq, jieba, pypinyin
+export MEDIA_ASR_DATA=~/podcasts
+./media-asr add 'https://feeds.fireside.fm/sv101/rss' --latest 20     # once per show
+cp docs/examples/podcast-library.toml "$MEDIA_ASR_DATA/library.toml"  # then edit
+HF_TOKEN=... DEEPSEEK_API_KEY=... ./media-asr library-update \
+  --gpu-env ~/.config/media-asr/gpu-a.env --fallback-gpu-env ~/.config/media-asr/remote.env
+```
+
+`$MEDIA_ASR_DATA/library.toml` lists the shows, one `[[show]]` table each (full
+example: [docs/examples/podcast-library.toml](docs/examples/podcast-library.toml)):
+
+```toml
+[[show]]
+name = "Latent Space"                               # optional, for logs
+feed = "https://api.substack.com/feed/podcast/1084089.rss"
+language = "en"                                     # zh or en
+hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # optional
+```
+
+- `feed`: the feed URL as subscribed with `add`; an episode belongs to the show
+  when its feed URL contains this text.
+- `language`: Whisper language and punctuation prompt.
+- `hosts`: recurring hosts who rarely say their own names on air, given to the
+  speaker-naming prompt as context.
+
+| Command | Purpose |
+| --- | --- |
+| `library-update` | The daily pipeline: `refresh --latest 5` (retried up to 3 times) → for each show `run --retry-failed --feed-contains <feed> --language <language> --diarize --diarization-backend pyannote` through `media-asr-remote` → `rediarize` → `enrich` → `correct-terms` → `stats`. Exits 1 if any feed, episode or step failed, after doing all the work it could; every step is idempotent, so a failed run can be re-run as is (`--latest`, `--workers`) |
+| `rediarize` | When one speaker label holds more than 75% of the speaking time (`--share`), DeepSeek checks whether it merges several people; hard merges (over 90%) and episodes with 3+ people are transcribed again on the GPU with that many speakers plus one (`--dry-run`, `--shard i/n`) |
+| `enrich` | Punctuation and speaker names (`--ids`, `--force`, `--limit`, `--workers`, `--chunk-workers`) |
+| `correct-terms` | Audited correction of misheard names and terms (`--ids`, `--force`, `--workers`) |
+
+`library-update` chooses the GPU host by `media-asr-remote` env file:
+`--gpu-env` (`MEDIA_ASR_GPU_ENV`) if it passes `remote-check` within 90 s, else
+`--fallback-gpu-env` (`MEDIA_ASR_FALLBACK_GPU_ENV`; default
+`MEDIA_ASR_REMOTE_ENV` or `~/.config/media-asr/remote.env`). It calls the
+`media-asr-remote` wrapper of the source checkout, so run it from a clone. All
+DeepSeek steps use `MEDIA_ASR_LLM_MODEL` (default `deepseek-flash`).
+
+Files per episode:
+
+```text
+items/<id>/
+  transcript.*         # ASR + diarization (SPEAKER_00 labels); only rediarize rewrites it
+  rediarize.json       # merged-speaker check: label, share before/after, verdict
+  transcript_named.*   # punctuated, speakers named, terms corrected; indexed for search
+  named_base.json      # punctuated and named segments before term correction
+  enrich.json          # punctuated segment count, each speaker name with its evidence
+  terms.json           # applied pairs with tier and count, rejected pairs with the reason
+```
+
+`rediarize.json`, `enrich.json` and `terms.json` are completion markers: each
+step skips items that have its marker. `rediarize` removes `enrich.json` of the
+episodes it redoes, and `enrich` removes `terms.json`, so later steps run again.
+
+Audit and rollback:
+
+- Punctuation is accepted per segment only if the letters and digits are
+  unchanged, so it never changes what was said.
+- Speaker names are used only at high or medium confidence; other labels become
+  `Host N`, `Guest N` or `Speaker N` (`主持人N`, `嘉宾N`, `说话人N`).
+- In term correction the model never rewrites text. It proposes `wrong -> right`
+  pairs, and a pair is applied as a literal replacement only if it sounds like a
+  mishearing (a Chinese pair keeps its length and every character pair is within
+  0.4 toneless pinyin similarity; an English pair keeps a spelling similarity of
+  0.55, 0.65 for short tokens; the wrong form is not a common word) and has a
+  basis: tier `reference` (the right form is in the show notes, episode titles or
+  speaker names) or tier `model` (a well-known term rated high confidence).
+  `terms.json` lists every pair with its tier and count, and every rejected pair
+  with the reason.
+- Each step keeps its input: `enrich` reads the raw `transcript.json`, and
+  `correct-terms` always starts from `named_base.json`, so corrections never
+  compound. `correct-terms --ids <id> --force` rebuilds the corrected transcript,
+  for example after a rule change; `enrich --ids <id> --force` rebuilds
+  everything from the raw transcript and removes `terms.json`, so the episode is
+  corrected again on the next run.
+
 ## Output layout
 
 ```text
@@ -251,7 +344,12 @@ Override the data directory with `MEDIA_ASR_DATA`. Model cache defaults to
 | `MEDIA_ASR_REMOTE_MODE` | `asr` or `full` |
 | `MEDIA_ASR_REMOTE_PASSWORD` | SSH password (prefer a key or a secret manager) |
 | `MEDIA_ASR_REMOTE_SECRET` | Optional Vault reference used by the wrapper |
+| `MEDIA_ASR_REMOTE_ENV` | Env file read by `media-asr-remote` (default `~/.config/media-asr/remote.env`) |
 | `HF_TOKEN` | HuggingFace token for pyannote models |
+| `DEEPSEEK_API_KEY` | DeepSeek API key (summaries, podcast library) |
+| `MEDIA_ASR_LLM_MODEL` | DeepSeek model of the podcast library steps (default `deepseek-flash`) |
+| `MEDIA_ASR_GPU_ENV` | `library-update`: env file of the preferred GPU host |
+| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`: env file of the fallback GPU host |
 
 ## Performance
 
@@ -273,7 +371,8 @@ Diarization adds about 100 s (pyannote 3.1) or 250 s (sherpa) on the
 
 - `small` is fast but weak on names, numbers, and mixed Chinese/English terms.
   Use `--prompt`, `medium`, or the remote GPU for better accuracy.
-- No translation, chaptering, or speaker-name recognition.
+- No translation or chaptering. Speaker names come only from the podcast
+  library's `enrich` step (DeepSeek reading show notes and transcript).
 - pyannote requires gated HuggingFace models and a token.
 - OpenAI Whisper can skip short passages or hallucinate credits at the end;
   the remote worker filters common credit lines but does not guarantee
@@ -296,10 +395,13 @@ python3 -m ruff check .
 Project layout:
 
 ```text
-media_asr/          CLI, fetch, ASR, DB, rendering, remote client
-scripts/            remote worker, OpenAI Whisper helper, comparison tool
+media_asr/          CLI, fetch, ASR, DB, rendering, remote client,
+                    podcast library (library, llm, enrich, terms, rediarize)
+scripts/            remote worker, OpenAI Whisper helper, comparison tool,
+                    All-In speaker tools, daily wrappers
 tests/              offline unit tests
 docs/remote-gpu.md  remote GPU setup and benchmarks
+docs/examples/      podcast library config
 ```
 
 ## License
