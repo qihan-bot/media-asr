@@ -262,3 +262,94 @@ def test_one_bad_episode_does_not_stop_the_others(tmp_path: Path, capsys) -> Non
     assert out.count("FAIL") == 4
     assert "people is not a number: 'two'" in out and "malformed verdict" in out
     store.close()
+
+
+def one_episode(tmp_path: Path, share: float = 0.95) -> tuple[Store, Path, str]:
+    store = Store(tmp_path / "media.db")
+    items_dir = tmp_path / "items"
+    item, _ = store.add_item(source="https://a/1.mp3", source_type="podcast", title="Ep")
+    store.save_result(
+        item,
+        segments=[Segment(0, 1, "a")],
+        duration=100.0,
+        language="en",
+        model="m",
+        transcript_path="t.md",
+    )
+    (items_dir / item).mkdir(parents=True)
+    (items_dir / item / "transcript.json").write_text(json.dumps({"segments": segments(share)}))
+    return store, items_dir, item
+
+
+class Verdict:
+    """Answers with a fixed verdict, after letting ``meanwhile`` play another run."""
+
+    def __init__(self, verdict: dict, meanwhile=lambda: None) -> None:
+        self.verdict, self.meanwhile = verdict, meanwhile
+
+    def chat(self, *args) -> dict:
+        self.meanwhile()
+        return dict(self.verdict)
+
+
+HARD_MERGE = {"merged": True, "people": 2, "reason": "asks and answers"}
+
+
+def test_no_rerun_on_a_verdict_about_an_older_transcript(tmp_path: Path, capsys) -> None:
+    store, items_dir, item = one_episode(tmp_path)
+    transcript = items_dir / item / "transcript.json"
+
+    def retranscribed() -> None:  # another run wrote a new transcript meanwhile
+        transcript.write_text(json.dumps({"segments": segments(0.55)}))
+
+    reruns = []
+    llm = Verdict(HARD_MERGE, retranscribed)
+    assert R.run(store.conn, llm, items_dir=items_dir, rerun=lambda *a: reruns.append(a)) == 1
+    assert reruns == [] and not (items_dir / item / "rediarize.json").exists()
+    assert "transcript.json changed meanwhile" in capsys.readouterr().out
+    store.close()
+
+
+def test_no_rerun_when_another_run_decided_meanwhile(tmp_path: Path) -> None:
+    store, items_dir, item = one_episode(tmp_path)
+    marker = items_dir / item / "rediarize.json"
+    llm = Verdict(HARD_MERGE, lambda: marker.write_text('{"by": "other run"}'))
+    reruns = []
+    assert R.run(store.conn, llm, items_dir=items_dir, rerun=lambda *a: reruns.append(a)) == 0
+    assert reruns == [] and json.loads(marker.read_text()) == {"by": "other run"}
+    store.close()
+
+
+def test_newer_state_after_the_rerun_is_kept(tmp_path: Path, monkeypatch) -> None:
+    store, items_dir, item = one_episode(tmp_path)
+    item_dir = items_dir / item
+    marker = item_dir / "rediarize.json"
+
+    def rerun(item_id: str, language: str, num_speakers: int):
+        (item_dir / "transcript.json").write_text(json.dumps({"segments": segments(0.6)}))
+        marker.write_text('{"by": "other run"}')  # another run checked the new transcript
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    assert R.run(store.conn, Verdict(HARD_MERGE), items_dir=items_dir, rerun=rerun) == 0
+    assert json.loads(marker.read_text()) == {"by": "other run"}
+
+    # Another run re-transcribes between the re-run and the marker: no marker.
+    marker.unlink()
+    (item_dir / "transcript.json").write_text(json.dumps({"segments": segments(0.95)}))
+
+    def rerun_only(item_id: str, language: str, num_speakers: int):
+        (item_dir / "transcript.json").write_text(json.dumps({"segments": segments(0.6)}))
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    real_lock, entries = R.item_lock, []
+
+    def lock(path: Path):
+        entries.append(path)
+        if len(entries) == 2:  # the lock after the re-run
+            (item_dir / "transcript.json").write_text(json.dumps({"segments": segments(0.7)}))
+        return real_lock(path)
+
+    monkeypatch.setattr(R, "item_lock", lock)
+    assert R.run(store.conn, Verdict(HARD_MERGE), items_dir=items_dir, rerun=rerun_only) == 0
+    assert len(entries) == 2 and not marker.exists()
+    store.close()

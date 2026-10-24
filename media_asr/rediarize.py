@@ -10,10 +10,12 @@ episode. Merged items whose largest label holds over 90% of the time, or with
 (an extra cluster absorbs intro voices and clips; with the bare count pyannote
 can still merge host and guest, e.g. 硅谷101 E247),
 their ``enrich.json`` is removed so ``enrich`` names them again,
-and ``rediarize.json`` records the decision so no item is checked twice. The
-re-run goes through ``media-asr run``, which takes the item's lock itself; the
-marker is written under the lock, after checking that the transcript the
-decision was made on is still there.
+and ``rediarize.json`` records the decision so no item is checked twice.
+Before it re-runs or marks an episode, the step holds the item's lock and
+checks that the transcript the model judged is still the episode's transcript
+and that no other run has decided meanwhile. The re-run itself goes through
+``media-asr run``, which takes the lock; afterwards the marker is written only
+if no other run has changed the episode since.
 
 ``media-asr rediarize`` needs ``DEEPSEEK_API_KEY`` and ``HF_TOKEN``; the GPU host
 comes from ``MEDIA_ASR_REMOTE_ENV`` as for ``media-asr-remote``.
@@ -147,31 +149,40 @@ def check(row, llm: LLM, *, share: float, dry_run: bool, items_dir: Path, rerun)
     # Library run 2026-10-23: re-diarizing every flagged episode moved the largest
     # label by <3 points in 81 of 86 cases (a guest holding ~80% of a long
     # interview is normal); it only helped hard merges and 3+ people.
-    if merged and people >= 2 and (before > 0.9 or people >= 3):
-        # Not under the item's lock: `run` takes it, and drops the later
-        # steps' markers before it writes the new transcript.
-        lang = "zh" if (row["language"] or "").startswith("zh") else "en"
-        result = rerun(row["id"], lang, people + 1)
-        if result.returncode != 0:
-            print(
-                f"FAIL rerun {row['id']}: {result.stdout[-300:]} {result.stderr[-300:]}",
-                flush=True,
-            )
-            return False
-        with item_lock(item_dir):
-            after = label_shares(read_json(transcript)[0]["segments"]).most_common(1)[0][1]
-            record["share_after"] = round(after, 3)
-            (item_dir / "enrich.json").unlink(missing_ok=True)
-            atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
-        print(f"       rerun: largest label {before:.0%} -> {after:.0%}", flush=True)
-        return True
+    rediarize = merged and people >= 2 and (before > 0.9 or people >= 3)
     with item_lock(item_dir):
+        # The verdict is about the transcript read above: act on it only if that
+        # is still the episode's transcript and no other run decided meanwhile.
         if marker.exists():
-            return True  # checked by another run meanwhile
+            return True
         if file_digest(transcript) != digest:
             print(f"FAIL check {row['id']}: transcript.json changed meanwhile", flush=True)
             return False
+        if not rediarize:
+            atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+            return True
+    # The re-run is not under the item's lock: `run` takes it, and drops the
+    # later steps' markers before it writes the new transcript.
+    lang = "zh" if (row["language"] or "").startswith("zh") else "en"
+    result = rerun(row["id"], lang, people + 1)
+    if result.returncode != 0:
+        print(
+            f"FAIL rerun {row['id']}: {result.stdout[-300:]} {result.stderr[-300:]}",
+            flush=True,
+        )
+        return False
+    produced = file_digest(transcript)
+    with item_lock(item_dir):
+        if marker.exists() or file_digest(transcript) != produced:
+            # Another run changed the episode after the re-run; its state wins,
+            # and an unmarked episode is checked again on the next run.
+            print(f"       rerun: done; {row['id']} changed again since, not marked", flush=True)
+            return True
+        after = label_shares(read_json(transcript)[0]["segments"]).most_common(1)[0][1]
+        record["share_after"] = round(after, 3)
+        (item_dir / "enrich.json").unlink(missing_ok=True)
         atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+    print(f"       rerun: largest label {before:.0%} -> {after:.0%}", flush=True)
     return True
 
 
