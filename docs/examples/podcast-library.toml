@@ -1,0 +1,53 @@
+# Shows of a podcast library, read by `media-asr library-update` and `media-asr enrich`.
+# Copy to $MEDIA_ASR_DATA/library.toml.
+#
+# One [[show]] table per subscribed feed:
+#   feed      RSS feed URL, as subscribed with `media-asr add <feed> --latest N`;
+#             an episode belongs to the show when its feed URL contains this text
+#   language  "zh" or "en": Whisper language and punctuation prompt
+#   name      optional, for logs
+#   hosts     optional: recurring hosts who rarely say their own names on air,
+#             given to the speaker-naming prompt as context
+
+[[show]]
+name = "硅谷101"
+feed = "https://feeds.fireside.fm/sv101/rss"
+language = "zh"
+
+[[show]]
+name = "晚点聊 LateTalk"
+feed = "https://feeds.fireside.fm/latetalk/rss"
+language = "zh"
+
+[[show]]
+name = "张小珺Jùn｜商业访谈录"
+feed = "https://feed.xyzfm.space/dk4yh3pkpjp3"
+language = "zh"
+
+[[show]]
+name = "邵亦波｜一波一会"
+feed = "https://feed.xyzfm.space/q4dnrcam497p"
+language = "zh"
+
+[[show]]
+name = "开始连接 LinkStart"
+feed = "https://feed.xyzfm.space/q9a6lueucj6a"
+language = "zh"
+
+[[show]]
+name = "Latent Space"
+feed = "https://api.substack.com/feed/podcast/1084089.rss"
+language = "en"
+hosts = "swyx (Shawn Wang; editor of Latent Space, organizer of the AI Engineer conference, AIE) and Alessio Fanelli (partner at Kernel Labs)"
+
+[[show]]
+name = "Automated with Brian Heater"
+feed = "https://rss.buzzsprout.com/2630998.rss"
+language = "en"
+hosts = "Brian Heater"
+
+[[show]]
+name = "Robot Talk"
+feed = "https://rss.libsyn.com/shows/292433/destinations/2292818.xml"
+language = "en"
+hosts = "Claire Asher"
