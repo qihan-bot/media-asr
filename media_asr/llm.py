@@ -1,4 +1,8 @@
-"""DeepSeek chat client shared by the podcast library steps."""
+"""Chat client shared by the podcast library steps.
+
+Default: the local DeepSeek on the DGX (OpenAI-compatible). User rule 2026-10-24: library LLM work runs on
+the LAN model, never the DeepSeek cloud API. ``MEDIA_ASR_LLM_URL`` / ``MEDIA_ASR_LLM_MODEL`` override.
+"""
 
 from __future__ import annotations
 
@@ -9,8 +13,9 @@ import time
 
 import httpx
 
-API_URL = "https://api.deepseek.com/chat/completions"
-DEFAULT_MODEL = "deepseek-flash"
+DEFAULT_URL = "http://192.168.100.161:8889/v1/chat/completions"
+DEFAULT_MODEL = "deepseek-v4.1-flash-tp4"
+ATTEMPTS = 5
 
 
 class TruncatedResponse(RuntimeError):
@@ -31,12 +36,14 @@ def parse_json(content: str, finish_reason: str | None = None):
 class LLM:
     """DeepSeek chat in JSON mode, reached directly (``trust_env=False``: no proxy).
 
-    The model comes from ``MEDIA_ASR_LLM_MODEL`` (default ``deepseek-flash``).
+    Endpoint ``MEDIA_ASR_LLM_URL`` (default the DGX), model ``MEDIA_ASR_LLM_MODEL``
+    (default ``deepseek-v4.1-flash-tp4``).
     """
 
     def __init__(self, key: str, *, model: str | None = None, client: httpx.Client | None = None):
         self.key = key
         self.model = model or os.environ.get("MEDIA_ASR_LLM_MODEL") or DEFAULT_MODEL
+        self.url = os.environ.get("MEDIA_ASR_LLM_URL") or DEFAULT_URL
         self.client = client or httpx.Client(trust_env=False)
 
     def __enter__(self) -> LLM:
@@ -48,7 +55,7 @@ class LLM:
     def chat(self, system: str, user: str, max_tokens: int):
         """Return the parsed JSON answer.
 
-        Three attempts: greedy first, then sampled at temperature 0.3, because
+        Five attempts: greedy first, then sampled at temperature 0.3, because
         greedy decoding repeats a malformed answer. Raises RuntimeError after the
         last failure, or TruncatedResponse if that answer was cut off at
         ``max_tokens``.
@@ -62,13 +69,13 @@ class LLM:
             "response_format": {"type": "json_object"},
         }
         last: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(ATTEMPTS):
             if attempt:
                 time.sleep(3 * attempt)
             payload["temperature"] = 0 if attempt == 0 else 0.3
             try:
                 response = self.client.post(
-                    API_URL,
+                    self.url,
                     headers={"Authorization": f"Bearer {self.key}"},
                     json=payload,
                     timeout=300,
@@ -79,4 +86,4 @@ class LLM:
             except Exception as exc:  # noqa: BLE001 - retried, then surfaced
                 last = exc
         error = TruncatedResponse if isinstance(last, TruncatedResponse) else RuntimeError
-        raise error(f"DeepSeek request failed: {last}")
+        raise error(f"LLM request failed: {last}")

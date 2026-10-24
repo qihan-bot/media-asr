@@ -211,8 +211,8 @@ def test_cut_off_answer_splits_the_chunk_instead_of_failing(tmp_path: Path) -> N
     client = TruncatingClient(fits=2)
     with llm.LLM("key", client=client) as model:
         assert C.run(store.conn, model, items_dir=items_dir) == 0
-    # 3 attempts on the cut-off 4-line chunk, then one call per half.
-    assert [len(chunk) for chunk in client.chunks] == [4, 4, 4, 2, 2]
+    # 5 attempts on the cut-off 4-line chunk, then one call per half.
+    assert [len(chunk) for chunk in client.chunks] == [4, 4, 4, 4, 4, 2, 2]
     report = json.loads((items_dir / item / "terms.json").read_text())
     assert [(f["wrong"], f["count"]) for f in report["applied"]] == [("Skading Law", 3)]
     assert report["replacements"] == 3
@@ -220,7 +220,7 @@ def test_cut_off_answer_splits_the_chunk_instead_of_failing(tmp_path: Path) -> N
     assert [s["text"] for s in named["segments"]][0] == "Scaling Law one."
     assert (
         named["model"]
-        == "whisper + deepseek-flash punctuation/speaker names + term correction (deepseek-flash)"
+        == "whisper + deepseek-flash punctuation/speaker names + term correction (deepseek-v4.1-flash-tp4)"
     )
     assert [row["text"] for row in store.segments_for(item)][3] == "More Scaling Law."
     store.close()

@@ -26,7 +26,7 @@ class Client:
         self.payloads: list[dict] = []
 
     def post(self, url, *, headers, json, timeout):
-        assert url == L.API_URL and headers["Authorization"] == "Bearer key"
+        assert url == L.DEFAULT_URL and headers["Authorization"] == "Bearer key"
         self.payloads.append(dict(json))
         return self.answers.pop(0)
 
@@ -49,14 +49,14 @@ def test_chat_retries_sampled_and_parses_fenced_json() -> None:
 
 
 def test_chat_reports_an_answer_cut_off_at_max_tokens() -> None:
-    client = Client(*[Response('{"fixes": [{"wrong": "Skad', "length")] * 3)
-    with pytest.raises(L.TruncatedResponse, match="DeepSeek request failed"):
+    client = Client(*[Response('{"fixes": [{"wrong": "Skad', "length")] * 5)
+    with pytest.raises(L.TruncatedResponse, match="LLM request failed"):
         L.LLM("key", client=client).chat("system", "user", 10)
-    assert len(client.payloads) == 3
+    assert len(client.payloads) == 5
 
 
 def test_chat_other_failures_are_not_truncation() -> None:
-    client = Client(*[Response("{bad", "stop")] * 3)
+    client = Client(*[Response("{bad", "stop")] * 5)
     with pytest.raises(RuntimeError) as info:
         L.LLM("key", client=client).chat("system", "user", 10)
     assert not isinstance(info.value, L.TruncatedResponse)
@@ -72,5 +72,5 @@ def test_model_from_environment_and_direct_connection(monkeypatch) -> None:
     assert L.LLM("key", client=Client()).model == "deepseek-pro"
     monkeypatch.delenv("MEDIA_ASR_LLM_MODEL")
     with L.LLM("key") as llm:
-        assert llm.model == "deepseek-flash"
+        assert llm.model == "deepseek-v4.1-flash-tp4"
         assert llm.client.trust_env is False

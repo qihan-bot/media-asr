@@ -902,10 +902,11 @@ def cmd_remove(store: Store, args: argparse.Namespace) -> int:
     return 0
 
 
-def _deepseek_key() -> str | None:
-    key = os.environ.get("DEEPSEEK_API_KEY")
+def _llm_key() -> str | None:
+    """Key of the library LLM endpoint: MEDIA_ASR_LLM_KEY, else LAN_MODEL_API_KEY (the DGX)."""
+    key = os.environ.get("MEDIA_ASR_LLM_KEY") or os.environ.get("LAN_MODEL_API_KEY")
     if not key:
-        print("set DEEPSEEK_API_KEY; run through `vibe vault run`", file=sys.stderr)
+        print("set LAN_MODEL_API_KEY (or MEDIA_ASR_LLM_KEY); run through `vibe vault run`", file=sys.stderr)
     return key
 
 
@@ -914,7 +915,7 @@ def cmd_enrich(store: Store, args: argparse.Namespace) -> int:
     from .library import LibraryError, load_shows
     from .llm import LLM
 
-    key = _deepseek_key()
+    key = _llm_key()
     if not key:
         return 1
     try:
@@ -943,7 +944,7 @@ def cmd_correct_terms(store: Store, args: argparse.Namespace) -> int:
         return 1
     from .llm import LLM
 
-    key = _deepseek_key()
+    key = _llm_key()
     if not key:
         return 1
     with LLM(key) as llm:
@@ -954,7 +955,7 @@ def cmd_rediarize(store: Store, args: argparse.Namespace) -> int:
     from . import rediarize
     from .llm import LLM
 
-    key = _deepseek_key()
+    key = _llm_key()
     if not key:
         return 1
 

@@ -22,7 +22,7 @@ episode at a time, in order, so re-runs reach the GPU host one after another.
 
 Run it as ``media-asr-remote rediarize`` (``library-update`` does) so the
 re-runs reach the GPU host of ``MEDIA_ASR_REMOTE_ENV``; it needs
-``DEEPSEEK_API_KEY`` and ``HF_TOKEN``.
+``LAN_MODEL_API_KEY`` (the DGX LLM) and ``HF_TOKEN``.
 """
 
 from __future__ import annotations

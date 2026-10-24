@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.5 — 2026-10-24
+
+- Podcast library LLM steps (enrich, correct-terms, rediarize) use the local DeepSeek on the DGX by default
+  (`MEDIA_ASR_LLM_URL`, default `http://192.168.100.161:8889/v1/chat/completions`, model
+  `deepseek-v4.1-flash-tp4`, key `MEDIA_ASR_LLM_KEY` or `LAN_MODEL_API_KEY`); the DeepSeek cloud API is no
+  longer used by the library.
+- Five attempts per request (malformed JSON from the model recurs at roughly one episode in a hundred).
+- The daily wrapper injects `LAN_MODEL_API_KEY` and runs the LLM steps with `--workers 2`, since the DGX model
+  is shared with other agents.
+
 ## 0.0.4 — 2026-10-24
 
 All-In is the ninth show of the podcast library; its voiceprint naming became a

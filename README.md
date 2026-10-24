@@ -224,7 +224,7 @@ the first turns. On a 94-minute, 5-speaker episode, pyannote 3.1 took about
 A podcast library is a data directory that follows several shows, possibly in
 different languages, and keeps them transcribed, diarized and punctuated, with
 speakers named and misheard names and terms corrected. It uses the remote GPU
-backend with pyannote, the DeepSeek API (`DEEPSEEK_API_KEY`), and the `library`
+backend with pyannote, an OpenAI-compatible LLM endpoint (default: the local DeepSeek on the DGX, key `LAN_MODEL_API_KEY`), and the `library`
 extras:
 
 ```bash
@@ -232,7 +232,7 @@ python3 -m pip install -e '.[library]'          # wordfreq, jieba, pypinyin
 export MEDIA_ASR_DATA=~/podcasts
 ./media-asr add 'https://feeds.fireside.fm/sv101/rss' --latest 20     # once per show
 cp docs/examples/podcast-library.toml "$MEDIA_ASR_DATA/library.toml"  # then edit
-HF_TOKEN=... DEEPSEEK_API_KEY=... ./media-asr library-update --jobs 3 \
+HF_TOKEN=... LAN_MODEL_API_KEY=... ./media-asr library-update --jobs 3 \
   --gpu-env ~/.config/media-asr/gpu-a.env --fallback-gpu-env ~/.config/media-asr/remote.env
 ```
 
@@ -275,7 +275,7 @@ transcription and `rediarize` are skipped and the run exits 1 (`enrich` and
 `correct-terms` still run). With neither option it uses `media-asr-remote`'s
 default (`MEDIA_ASR_REMOTE_ENV` or `~/.config/media-asr/remote.env`) unchecked.
 It calls the `media-asr-remote` wrapper of the source checkout, so run it from a
-clone. All DeepSeek steps use `MEDIA_ASR_LLM_MODEL` (default `deepseek-flash`).
+clone. All LLM steps use `MEDIA_ASR_LLM_URL` (default `http://192.168.100.161:8889/v1/chat/completions`, the DGX) and `MEDIA_ASR_LLM_MODEL` (default `deepseek-v4.1-flash-tp4`); the key comes from `MEDIA_ASR_LLM_KEY` or `LAN_MODEL_API_KEY`.
 
 With `--jobs N`, up to N episodes are in flight on the GPU host: one job's
 download and ffmpeg run while another uses the GPU, and the jobs take turns on
@@ -380,8 +380,10 @@ Override the data directory with `MEDIA_ASR_DATA`. Model cache defaults to
 | `MEDIA_ASR_REMOTE_SECRET` | Optional Vault reference used by the wrapper |
 | `MEDIA_ASR_REMOTE_ENV` | Env file read by `media-asr-remote` (default `~/.config/media-asr/remote.env`) |
 | `HF_TOKEN` | HuggingFace token for pyannote models |
-| `DEEPSEEK_API_KEY` | DeepSeek API key (summaries, podcast library) |
-| `MEDIA_ASR_LLM_MODEL` | DeepSeek model of the podcast library steps (default `deepseek-flash`) |
+| `DEEPSEEK_API_KEY` | DeepSeek cloud API key (`summarize --engine deepseek` only) |
+| `MEDIA_ASR_LLM_URL` | LLM endpoint of the podcast library steps (default the DGX DeepSeek) |
+| `MEDIA_ASR_LLM_MODEL` | Model of the podcast library steps (default `deepseek-v4.1-flash-tp4`) |
+| `LAN_MODEL_API_KEY` / `MEDIA_ASR_LLM_KEY` | Key of that endpoint |
 | `MEDIA_ASR_GPU_ENV` | `library-update`: env file of the preferred GPU host |
 | `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`: env file of the fallback GPU host |
 

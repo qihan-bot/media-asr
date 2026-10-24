@@ -49,7 +49,7 @@ def test_library_wrapper_runs_three_jobs_on_the_5900x_with_the_laptop_as_fallbac
     _, calls = run(ROOT / "scripts/podcasts_library_daily.sh", home)
     config = home / ".config/media-asr"
     assert calls == [
-        "vibe env= host= vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value "
-        f"--env HF_TOKEN=HF_TOKEN.value -- {ROOT}/media-asr library-update --jobs 3 "
+        "vibe env= host= vault run --env LAN_MODEL_API_KEY=LAN_MODEL_API_KEY.value "
+        f"--env HF_TOKEN=HF_TOKEN.value -- {ROOT}/media-asr library-update --jobs 3 --workers 2 "
         f"--gpu-env {config}/remote-5900x.env --fallback-gpu-env {config}/remote.env"
     ]

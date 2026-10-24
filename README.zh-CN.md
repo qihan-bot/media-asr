@@ -209,14 +209,14 @@ pyannote 3.1 分离约 100 秒，能干净地分出 5 人；sherpa 约 250 秒�
 
 播客库是一个数据目录，里面跟踪多档节目（可以是不同语言），持续完成转写、
 说话人分离、补标点、说话人姓名识别，以及听错的人名和术语纠错。它需要远程
-GPU 后端（pyannote）、DeepSeek API（`DEEPSEEK_API_KEY`）和 `library` 额外依赖：
+GPU 后端（pyannote）、OpenAI 兼容的 LLM 端点（默认 DGX 本地 DeepSeek，密钥 `LAN_MODEL_API_KEY`）和 `library` 额外依赖：
 
 ```bash
 python3 -m pip install -e '.[library]'          # wordfreq、jieba、pypinyin
 export MEDIA_ASR_DATA=~/podcasts
 ./media-asr add 'https://feeds.fireside.fm/sv101/rss' --latest 20     # 每档节目订阅一次
 cp docs/examples/podcast-library.toml "$MEDIA_ASR_DATA/library.toml"  # 再按需修改
-HF_TOKEN=... DEEPSEEK_API_KEY=... ./media-asr library-update --jobs 3 \
+HF_TOKEN=... LAN_MODEL_API_KEY=... ./media-asr library-update --jobs 3 \
   --gpu-env ~/.config/media-asr/gpu-a.env --fallback-gpu-env ~/.config/media-asr/remote.env
 ```
 
@@ -255,7 +255,7 @@ voiceprints = "voiceprints/latent-space.npz"        # 可选
 两个选项都不给时，不做检查，直接用 `media-asr-remote` 的默认值
 （`MEDIA_ASR_REMOTE_ENV` 或 `~/.config/media-asr/remote.env`）。它调用源码目录里的
 `media-asr-remote` 包装脚本，所以要在克隆的仓库里运行。所有 DeepSeek 步骤使用
-`MEDIA_ASR_LLM_MODEL`（默认 `deepseek-flash`）。
+`MEDIA_ASR_LLM_MODEL`（默认 `deepseek-v4.1-flash-tp4`），端点 `MEDIA_ASR_LLM_URL`（默认 DGX `http://192.168.100.161:8889/v1/chat/completions`），密钥 `MEDIA_ASR_LLM_KEY` 或 `LAN_MODEL_API_KEY`。
 
 `--jobs N` 时，GPU 主机上同时最多处理 N 期：一期在下载和 ffmpeg 时，另一期可以用
 GPU；各期通过远程 worker 的锁轮流使用 GPU（远程工作目录下的 `gpu.lock`，从加载
@@ -348,8 +348,10 @@ data/
 | `MEDIA_ASR_REMOTE_SECRET` | 包装脚本使用的可选 Vault 引用 |
 | `MEDIA_ASR_REMOTE_ENV` | `media-asr-remote` 读取的 env 文件（默认 `~/.config/media-asr/remote.env`） |
 | `HF_TOKEN` | pyannote 模型所需的 HuggingFace token |
-| `DEEPSEEK_API_KEY` | DeepSeek API key（摘要、播客库） |
-| `MEDIA_ASR_LLM_MODEL` | 播客库各步骤使用的 DeepSeek 模型（默认 `deepseek-flash`） |
+| `DEEPSEEK_API_KEY` | DeepSeek 云端 API key（仅 `summarize --engine deepseek`） |
+| `MEDIA_ASR_LLM_URL` | 播客库各步骤的 LLM 端点（默认 DGX 本地 DeepSeek） |
+| `MEDIA_ASR_LLM_MODEL` | 播客库各步骤使用的模型（默认 `deepseek-v4.1-flash-tp4`） |
+| `LAN_MODEL_API_KEY` / `MEDIA_ASR_LLM_KEY` | 该端点的密钥 |
 | `MEDIA_ASR_GPU_ENV` | `library-update`：首选 GPU 主机的 env 文件 |
 | `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`：备用 GPU 主机的 env 文件 |
 

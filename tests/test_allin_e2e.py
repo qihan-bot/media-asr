@@ -68,7 +68,7 @@ def test_all_in_goes_through_the_library_named_by_voice(
             "MEDIA_ASR_BACKEND": "remote",
             "MEDIA_ASR_REMOTE_MODE": "full",
             "MEDIA_ASR_REMOTE_HOST": "gpu.example",
-            "DEEPSEEK_API_KEY": "fake",
+            "LAN_MODEL_API_KEY": "fake",
             "MEDIA_ASR_LLM_MODEL": "fake-llm",
         }
     )
