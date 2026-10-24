@@ -212,6 +212,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rediarize.add_argument("--shard", default="0/1", help="i/n: every n-th item, for parallel GPUs")
 
+    library = sub.add_parser(
+        "library-update",
+        help="podcast library: refresh, transcribe, rediarize, enrich, correct-terms",
+    )
+    library.add_argument(
+        "--gpu-env",
+        default=os.environ.get("MEDIA_ASR_GPU_ENV"),
+        help="env file of the preferred GPU host, used if remote-check passes",
+    )
+    library.add_argument(
+        "--fallback-gpu-env",
+        default=os.environ.get("MEDIA_ASR_FALLBACK_GPU_ENV"),
+        help="env file of the GPU host to use otherwise (default: media-asr-remote's)",
+    )
+    library.add_argument("--latest", type=int, default=5, help="episodes to check per feed")
+    library.add_argument(
+        "--workers", type=int, default=4, help="items in parallel for enrich and correct-terms"
+    )
+
     sub.add_parser("feeds", help="list subscribed feeds")
     sub.add_parser("stats", help="show counts")
     sub.add_parser("init", help="create data directories")
@@ -252,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_correct_terms(store, args)
         if args.command == "rediarize":
             return cmd_rediarize(store, args)
+        if args.command == "library-update":
+            return cmd_library_update(store, args)
         if args.command == "feeds":
             return cmd_feeds(store)
         if args.command == "stats":
@@ -892,6 +913,23 @@ def cmd_rediarize(store: Store, args: argparse.Namespace) -> int:
         return rediarize.run(
             store.conn, llm, share=args.share, dry_run=args.dry_run, shard=args.shard
         )
+
+
+def cmd_library_update(store: Store, args: argparse.Namespace) -> int:
+    from .library import LibraryError, load_shows, update
+
+    try:
+        return update(
+            store,
+            load_shows(),
+            gpu_env=args.gpu_env,
+            fallback_gpu_env=args.fallback_gpu_env,
+            latest=args.latest,
+            workers=args.workers,
+        )
+    except LibraryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 def cmd_feeds(store: Store) -> int:

@@ -1,4 +1,4 @@
-"""Podcast library: the show list and RSS show notes.
+"""Podcast library: the show list, RSS show notes and the daily update.
 
 A podcast library is a data directory (``MEDIA_ASR_DATA``) whose
 ``library.toml`` lists the shows, one ``[[show]]`` table each:
@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import sqlite3
+import subprocess
+import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,12 +31,17 @@ import feedparser
 import httpx
 
 from .config import DATA_DIR
+from .db import Store
+from .util import now_iso
 
 ROOT = Path(__file__).resolve().parent.parent
 # The source checkout's wrapper: loads MEDIA_ASR_REMOTE_ENV, remote full mode.
 REMOTE = ROOT / "media-asr-remote"
+MEDIA_ASR = [sys.executable, "-m", "media_asr"]
 LANGUAGES = ("zh", "en")
 SHOW_KEYS = {"name", "feed", "language", "hosts"}
+# Remote ASR progress lines; dropped from the update log.
+PROGRESS = re.compile(r"frames/s|still running")
 
 
 class LibraryError(ValueError):
@@ -132,3 +141,138 @@ def episode_notes(notes: dict, row: sqlite3.Row) -> str:
         or notes.get(f"{row['feed_url']}\t{row['title']}")
         or "(not available)"
     )
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+class Shell:
+    """Runs the update's commands from the source root; tests replace it."""
+
+    def check(self, cmd: list[str], env: dict[str, str], timeout: float) -> bool:
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+        return result.returncode == 0
+
+    def stream(
+        self, cmd: list[str], env: dict[str, str], drop: re.Pattern | None = None
+    ) -> tuple[int, str]:
+        """Print the command's output except lines matching ``drop``; return
+        the exit code and the printed output."""
+        kept = []
+        with subprocess.Popen(
+            cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        ) as proc:
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace")
+                if drop is None or not drop.search(line):
+                    print(line, end="", flush=True)
+                    kept.append(line)
+        return proc.returncode, "".join(kept)
+
+
+def update(
+    store: Store,
+    shows: list[Show],
+    *,
+    gpu_env: str | None = None,
+    fallback_gpu_env: str | None = None,
+    latest: int = 5,
+    workers: int = 4,
+    shell: Shell | None = None,
+    sleep=time.sleep,
+) -> int:
+    """Daily refresh: feeds -> per-show remote GPU transcription with pyannote
+    diarization -> rediarize -> enrich -> correct-terms.
+
+    The GPU host is ``gpu_env`` if it passes ``remote-check``, else
+    ``fallback_gpu_env`` (else the wrapper's default env file). Every step is
+    idempotent, so a failed run can be re-run as is. Returns 1 if any feed,
+    episode or step failed, after doing all the work it could.
+    """
+    if not REMOTE.exists():
+        raise LibraryError(f"library-update needs the source checkout wrapper {REMOTE}")
+    shell = shell or Shell()
+    status = 0
+    log(f"== {now_iso()} start")
+    env = dict(os.environ, MEDIA_ASR_DATA=str(DATA_DIR.resolve()), PYTHONUNBUFFERED="1")
+    if gpu_env and shell.check(
+        [str(REMOTE), "remote-check"], {**env, "MEDIA_ASR_REMOTE_ENV": gpu_env}, timeout=90
+    ):
+        env["MEDIA_ASR_REMOTE_ENV"] = gpu_env
+    else:
+        if gpu_env:
+            log(f"gpu: {gpu_env} failed remote-check")
+        if fallback_gpu_env:
+            env["MEDIA_ASR_REMOTE_ENV"] = fallback_gpu_env
+    log(f"gpu: {env.get('MEDIA_ASR_REMOTE_ENV', '~/.config/media-asr/remote.env (default)')}")
+
+    log("== refresh feeds")
+    for attempt in (1, 2, 3):
+        code, out = shell.stream([*MEDIA_ASR, "refresh", "--latest", str(latest)], env)
+        if code == 0 and not re.search(r"^feed failed", out, re.M):
+            break
+        if attempt == 3:
+            log("WARN: some feeds failed 3 times")
+            status = 1
+        else:
+            sleep(attempt * 30)
+
+    log("== transcribe")
+    subscribed = [row["url"] for row in store.list_feeds()]
+    for show in shows:
+        if not any(show.matches(url) for url in subscribed):
+            log(f"WARN: {show.name or show.feed} is not subscribed: media-asr add {show.feed}")
+            status = 1
+            continue
+        code, _ = shell.stream(
+            [
+                str(REMOTE),
+                "run",
+                "--retry-failed",
+                "--feed-contains",
+                show.feed,
+                "--language",
+                show.language,
+                "--diarize",
+                "--diarization-backend",
+                "pyannote",
+            ],
+            env,
+            drop=PROGRESS,
+        )
+        if code:
+            status = 1
+    failed = store.list_items(status="failed", limit=1000)
+    if failed:
+        log("FAILED episodes:")
+        for row in failed:
+            log(f"{row['id']}  {row['title']}")
+        status = 1
+
+    for title, step in (
+        ("re-diarize episodes where one label merged several people", ["rediarize"]),
+        ("punctuation + speaker names", ["enrich", "--workers", str(workers)]),
+        (
+            "term correction (audited replacement pairs, see terms.json)",
+            ["correct-terms", "--workers", str(workers)],
+        ),
+    ):
+        log(f"== {title}")
+        code, _ = shell.stream([*MEDIA_ASR, *step], env)
+        if code:
+            status = 1
+
+    log(f"== {now_iso()} end status={status}")
+    shell.stream([*MEDIA_ASR, "stats"], env)
+    return status
