@@ -174,6 +174,9 @@ SSH host keys are checked against `~/.ssh/known_hosts`. Only use
 provided through `MEDIA_ASR_REMOTE_PASSWORD`; do not put them in repository
 files or shell history.
 
+Several jobs can share one host: each runs its own copy of the worker, and they
+take turns on the GPU through `gpu.lock` in the remote work directory.
+
 Remote setup (CUDA PyTorch, OpenAI Whisper, ffmpeg, yt-dlp, diarization models)
 is documented in [docs/remote-gpu.md](docs/remote-gpu.md).
 
@@ -229,7 +232,7 @@ python3 -m pip install -e '.[library]'          # wordfreq, jieba, pypinyin
 export MEDIA_ASR_DATA=~/podcasts
 ./media-asr add 'https://feeds.fireside.fm/sv101/rss' --latest 20     # once per show
 cp docs/examples/podcast-library.toml "$MEDIA_ASR_DATA/library.toml"  # then edit
-HF_TOKEN=... DEEPSEEK_API_KEY=... ./media-asr library-update \
+HF_TOKEN=... DEEPSEEK_API_KEY=... ./media-asr library-update --jobs 3 \
   --gpu-env ~/.config/media-asr/gpu-a.env --fallback-gpu-env ~/.config/media-asr/remote.env
 ```
 
@@ -252,17 +255,29 @@ hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # optional
 
 | Command | Purpose |
 | --- | --- |
-| `library-update` | The daily pipeline: `refresh --latest 5` (retried up to 3 times) → for each show `run --retry-failed --feed-contains <feed> --language <language> --diarize --diarization-backend pyannote` through `media-asr-remote` → `media-asr-remote rediarize` → `enrich` → `correct-terms` → `stats`. Exits 1 if any feed, episode or step failed, after doing all the work it could; every step is idempotent, so a failed run can be re-run as is (`--latest`, `--workers`) |
-| `rediarize` | When one speaker label holds more than 75% of the speaking time (`--share`), DeepSeek checks whether it merges several people; hard merges (over 90%) and episodes with 3+ people are transcribed again on the GPU with that many speakers plus one. The check, the re-run and the marker of an episode happen under one hold of its lock, in this process, so run it as `media-asr-remote rediarize` to reach the GPU host (`--dry-run`, `--shard i/n`) |
+| `library-update` | The daily pipeline: `refresh --latest 5` (retried up to 3 times) → the shows' pending and failed episodes (oldest first, at most 100 per show), each in its own `media-asr-remote run --ids <id> --language <show language> --diarize --diarization-backend pyannote`, `--jobs` at a time → `media-asr-remote rediarize` → `enrich` → `correct-terms` → `stats`. Exits 1 if any feed, episode or step failed, after doing all the work it could; every step is idempotent, so a failed run can be re-run as is (`--latest`, `--workers`, `--jobs`) |
+| `rediarize` | When one speaker label holds more than 75% of the speaking time (`--share`), DeepSeek checks whether it merges several people; hard merges (over 90%) and episodes with 3+ people are transcribed again on the GPU with that many speakers plus one. The check, the re-run and the marker of an episode happen under one hold of its lock, in this process, so run it as `media-asr-remote rediarize` to reach the GPU host (`--dry-run`, `--shard i/n`; `--workers N` runs the model checks N at a time, re-runs still go one at a time) |
 | `enrich` | Punctuation and speaker names (`--ids`, `--force`, `--limit`, `--workers`, `--chunk-workers`) |
 | `correct-terms` | Audited correction of misheard names and terms (`--ids`, `--force`, `--workers`) |
 
 `library-update` chooses the GPU host by `media-asr-remote` env file:
-`--gpu-env` (`MEDIA_ASR_GPU_ENV`) if it passes `remote-check` within 90 s, else
-`--fallback-gpu-env` (`MEDIA_ASR_FALLBACK_GPU_ENV`; default
-`MEDIA_ASR_REMOTE_ENV` or `~/.config/media-asr/remote.env`). It calls the
-`media-asr-remote` wrapper of the source checkout, so run it from a clone. All
-DeepSeek steps use `MEDIA_ASR_LLM_MODEL` (default `deepseek-flash`).
+`--gpu-env` (`MEDIA_ASR_GPU_ENV`) if it passes `remote-check` within 90 s, with
+`--jobs` episodes at a time; else `--fallback-gpu-env`
+(`MEDIA_ASR_FALLBACK_GPU_ENV`) if it passes, one episode at a time (a Windows
+host has no GPU lock). The fallback is optional: when no given host passes,
+transcription and `rediarize` are skipped and the run exits 1 (`enrich` and
+`correct-terms` still run). With neither option it uses `media-asr-remote`'s
+default (`MEDIA_ASR_REMOTE_ENV` or `~/.config/media-asr/remote.env`) unchecked.
+It calls the `media-asr-remote` wrapper of the source checkout, so run it from a
+clone. All DeepSeek steps use `MEDIA_ASR_LLM_MODEL` (default `deepseek-flash`).
+
+With `--jobs N`, up to N episodes are in flight on the GPU host: one job's
+download and ffmpeg run while another uses the GPU, and the jobs take turns on
+the GPU through the remote workers' lock (`gpu.lock` in the remote work
+directory, held from loading Whisper to the end of pyannote; see
+[docs/remote-gpu.md](docs/remote-gpu.md#several-jobs-on-one-host)). Each
+episode's output is logged as one block when it ends, after a `start` line when
+it begins.
 
 Files per episode:
 
@@ -358,8 +373,8 @@ Override the data directory with `MEDIA_ASR_DATA`. Model cache defaults to
 | `HF_TOKEN` | HuggingFace token for pyannote models |
 | `DEEPSEEK_API_KEY` | DeepSeek API key (summaries, podcast library) |
 | `MEDIA_ASR_LLM_MODEL` | DeepSeek model of the podcast library steps (default `deepseek-flash`) |
-| `MEDIA_ASR_GPU_ENV` | `library-update`: env file of the preferred GPU host |
-| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`: env file of the fallback GPU host |
+| `MEDIA_ASR_GPU_ENV` | `library-update`, `scripts/podcast_daily.sh`: env file of the preferred GPU host |
+| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`, `scripts/podcast_daily.sh`: env file of the fallback GPU host |
 
 ## Performance
 

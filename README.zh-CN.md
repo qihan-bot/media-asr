@@ -162,6 +162,9 @@ SSH 主机密钥按 `~/.ssh/known_hosts` 校验。`--remote-auto-add-host-key` �
 在首次可信连接时使用。密码通过 `MEDIA_ASR_REMOTE_PASSWORD` 提供，不要写进
 仓库文件或 shell 历史。
 
+多个任务可以共用一台主机：每个任务运行自己的一份 worker 代码，并通过远程工作目录下的
+`gpu.lock` 轮流使用 GPU。
+
 远端 CUDA PyTorch、OpenAI Whisper、ffmpeg、yt-dlp、说话人分离模型的安装
 见 [docs/remote-gpu.md](docs/remote-gpu.md)。
 
@@ -213,7 +216,7 @@ python3 -m pip install -e '.[library]'          # wordfreq、jieba、pypinyin
 export MEDIA_ASR_DATA=~/podcasts
 ./media-asr add 'https://feeds.fireside.fm/sv101/rss' --latest 20     # 每档节目订阅一次
 cp docs/examples/podcast-library.toml "$MEDIA_ASR_DATA/library.toml"  # 再按需修改
-HF_TOKEN=... DEEPSEEK_API_KEY=... ./media-asr library-update \
+HF_TOKEN=... DEEPSEEK_API_KEY=... ./media-asr library-update --jobs 3 \
   --gpu-env ~/.config/media-asr/gpu-a.env --fallback-gpu-env ~/.config/media-asr/remote.env
 ```
 
@@ -234,17 +237,26 @@ hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # 可选
 
 | 命令 | 用途 |
 | --- | --- |
-| `library-update` | 每日流程：`refresh --latest 5`（失败最多重试 3 次）→ 每档节目通过 `media-asr-remote` 执行 `run --retry-failed --feed-contains <feed> --language <language> --diarize --diarization-backend pyannote` → `media-asr-remote rediarize` → `enrich` → `correct-terms` → `stats`。任何 feed、单期或步骤失败时，做完能做的部分后以 1 退出；每一步都幂等，失败后可原样重跑（`--latest`、`--workers`） |
-| `rediarize` | 某个说话人标签占说话时长超过 75%（`--share`）时，由 DeepSeek 判断是否混入了多人；严重合并（超过 90%）或 3 人以上的节目，在 GPU 上按“人数 + 1”重新转写分离。同一期的检查、重跑和完成标记都在这个进程里、持有同一把锁完成，所以要用 `media-asr-remote rediarize` 运行以连上 GPU 主机（`--dry-run`、`--shard i/n`） |
+| `library-update` | 每日流程：`refresh --latest 5`（失败最多重试 3 次）→ 各档节目待处理和失败的单期（从旧到新，每档最多 100 期），每期单独通过 `media-asr-remote` 执行 `run --ids <id> --language <节目语言> --diarize --diarization-backend pyannote`，同时最多 `--jobs` 期 → `media-asr-remote rediarize` → `enrich` → `correct-terms` → `stats`。任何 feed、单期或步骤失败时，做完能做的部分后以 1 退出；每一步都幂等，失败后可原样重跑（`--latest`、`--workers`、`--jobs`） |
+| `rediarize` | 某个说话人标签占说话时长超过 75%（`--share`）时，由 DeepSeek 判断是否混入了多人；严重合并（超过 90%）或 3 人以上的节目，在 GPU 上按“人数 + 1”重新转写分离。同一期的检查、重跑和完成标记都在这个进程里、持有同一把锁完成，所以要用 `media-asr-remote rediarize` 运行以连上 GPU 主机（`--dry-run`、`--shard i/n`；`--workers N` 让模型判断 N 期并行，重跑仍逐期进行） |
 | `enrich` | 补标点、识别说话人姓名（`--ids`、`--force`、`--limit`、`--workers`、`--chunk-workers`） |
 | `correct-terms` | 可审计的人名 / 术语纠错（`--ids`、`--force`、`--workers`） |
 
 `library-update` 按 `media-asr-remote` 的 env 文件选择 GPU 主机：`--gpu-env`
-（`MEDIA_ASR_GPU_ENV`）在 90 秒内通过 `remote-check` 就用它，否则用
-`--fallback-gpu-env`（`MEDIA_ASR_FALLBACK_GPU_ENV`；默认 `MEDIA_ASR_REMOTE_ENV`
-或 `~/.config/media-asr/remote.env`）。它调用源码目录里的 `media-asr-remote`
-包装脚本，所以要在克隆的仓库里运行。所有 DeepSeek 步骤使用
+（`MEDIA_ASR_GPU_ENV`）在 90 秒内通过 `remote-check` 就用它，同时最多 `--jobs`
+期；否则在 `--fallback-gpu-env`（`MEDIA_ASR_FALLBACK_GPU_ENV`）通过检查时用它，
+一次一期（Windows 主机没有 GPU 锁）。备用主机可以不配：给出的主机都没通过检查时，
+跳过转写和 `rediarize`，本次以 1 退出（`enrich` 和 `correct-terms` 照常运行）。
+两个选项都不给时，不做检查，直接用 `media-asr-remote` 的默认值
+（`MEDIA_ASR_REMOTE_ENV` 或 `~/.config/media-asr/remote.env`）。它调用源码目录里的
+`media-asr-remote` 包装脚本，所以要在克隆的仓库里运行。所有 DeepSeek 步骤使用
 `MEDIA_ASR_LLM_MODEL`（默认 `deepseek-flash`）。
+
+`--jobs N` 时，GPU 主机上同时最多处理 N 期：一期在下载和 ffmpeg 时，另一期可以用
+GPU；各期通过远程 worker 的锁轮流使用 GPU（远程工作目录下的 `gpu.lock`，从加载
+Whisper 一直持有到 pyannote 结束，见
+[docs/remote-gpu.md](docs/remote-gpu.md#several-jobs-on-one-host)）。每期开始时日志
+记一行 `start`，结束时把该期的输出作为一整段写入日志。
 
 每期节目的文件：
 
@@ -331,8 +343,8 @@ data/
 | `HF_TOKEN` | pyannote 模型所需的 HuggingFace token |
 | `DEEPSEEK_API_KEY` | DeepSeek API key（摘要、播客库） |
 | `MEDIA_ASR_LLM_MODEL` | 播客库各步骤使用的 DeepSeek 模型（默认 `deepseek-flash`） |
-| `MEDIA_ASR_GPU_ENV` | `library-update`：首选 GPU 主机的 env 文件 |
-| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`：备用 GPU 主机的 env 文件 |
+| `MEDIA_ASR_GPU_ENV` | `library-update`、`scripts/podcast_daily.sh`：首选 GPU 主机的 env 文件 |
+| `MEDIA_ASR_FALLBACK_GPU_ENV` | `library-update`、`scripts/podcast_daily.sh`：备用 GPU 主机的 env 文件 |
 
 ## 性能参考
 

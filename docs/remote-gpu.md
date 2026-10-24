@@ -140,11 +140,27 @@ job's downloads overlap another's GPU work. A job that has to wait logs
   `MEDIA_ASR_REMOTE_WORKDIR`.
 - A job keeps its GPU memory until its worker exits, a few seconds after it
   releases the lock (rendering and bundling); one Whisper large-v3-turbo plus
-  pyannote 3.1 job peaks at about 7.2 GiB, so a 12 GB card has room for that.
+  pyannote 3.1 job peaks at 7226 MiB on an RTX 3080 Ti, so a 12 GB card has
+  room for that.
 - Without `fcntl` (Windows hosts) the lock is a no-op; run one job at a time
   there.
 - `scripts/embed_speakers_worker.py` (All-In voiceprints) does not take the
   lock: it runs one small speaker-embedding model.
+
+Measured on an RTX 3080 Ti host (2026-10-24; `library-update` on a scratch
+library of 3 podcast episodes, 158 min of audio; nvidia-smi sampled every 0.5 s):
+
+| | `--jobs 1` | `--jobs 3` |
+| --- | ---: | ---: |
+| Transcription wall time | 625 s | 580 s |
+| GPU busy (utilization > 0) | 84% | 90% |
+| Mean GPU utilization | 62% | 68% |
+| Peak GPU memory | 7226 MiB | 7226 MiB |
+
+Downloads ran at 7–17 MB/s on that host, so little was left to overlap; most
+of the remaining idle time is inside the locked phase (model loading,
+pyannote's CPU work). A slower download hides behind another job's GPU phase
+the same way, so the gain grows with download time (not measured).
 
 ## Diarization
 

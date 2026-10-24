@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.0.3 — 2026-10-24
+
+One GPU host, kept busy: several remote jobs share it and take turns on its GPU.
+
+- Remote workers hold an flock on `gpu.lock` in the remote work directory from
+  loading Whisper to the end of pyannote diarization (the ASR-only script, when
+  given `--gpu-lock`: loading and transcribing). Download, ffmpeg, sherpa-onnx
+  (CPU), rendering and bundling run outside it. A no-op where `fcntl` is
+  unavailable (Windows). Output files are unchanged.
+- Each remote job uploads and runs its own copy of the worker and the package
+  in `jobs/<id>/`. They used to share the work directory root, so a starting
+  job could rewrite code another job was importing.
+- `library-update --jobs N` (default 1): the shows' pending and failed episodes
+  are queued (oldest first, at most 100 per show, each once) and transcribed N
+  at a time, each with its show's language in its own
+  `media-asr-remote run --ids`. A failed episode fails only itself; each
+  episode's output is logged as one block, and the step ends with a count.
+  Exit codes are unchanged.
+- GPU host: `--gpu-env` with `--jobs`; else `--fallback-gpu-env`, one episode
+  at a time, now only if it passes `remote-check`. The fallback is optional:
+  when no given host passes, transcription and `rediarize` are skipped and the
+  run exits 1 (`enrich` and `correct-terms` still run).
+- `rediarize --workers N` (default 1) runs the model checks N at a time; the
+  verdicts are acted on one episode at a time, in order, so re-runs still go
+  to the GPU one after another. `library-update --workers` applies to it too.
+- `scripts/podcasts_library_daily.sh` runs `--jobs 3` on the 5900x, with the
+  5090 laptop (`remote.env`) as fallback. `scripts/podcast_daily.sh` (All-In)
+  now picks its host the same way (`MEDIA_ASR_GPU_ENV`,
+  `MEDIA_ASR_FALLBACK_GPU_ENV`; `MEDIA_ASR_REMOTE_ENV` forces one) instead of
+  always using `remote.env`.
+- Measured on the RTX 3080 Ti host with 3 episodes (158 min of audio):
+  transcription 625 s with `--jobs 1`, 580 s with `--jobs 3`; GPU busy 84% →
+  90% of the time, peak memory 7226 MiB in both (see docs/remote-gpu.md).
+
 ## 0.0.2 — 2026-10-24
 
 Supersedes 0.01 (PEP 440 reads "0.01" as 0.1, which would sort after 0.0.2).
