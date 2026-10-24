@@ -245,6 +245,7 @@ name = "Latent Space"                               # optional, for logs
 feed = "https://api.substack.com/feed/podcast/1084089.rss"
 language = "en"                                     # zh or en
 hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # optional
+voiceprints = "voiceprints/latent-space.npz"        # optional
 ```
 
 - `feed`: the feed URL as subscribed with `add`; an episode belongs to the show
@@ -252,12 +253,17 @@ hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # optional
 - `language`: Whisper language and punctuation prompt.
 - `hosts`: recurring hosts who rarely say their own names on air, given to the
   speaker-naming prompt as context.
+- `voiceprints`: reference voices of the recurring speakers (an `.npz`, relative
+  to the data directory); the show's episodes then go through `voiceprint`, and
+  speakers whose voice matches one are named by voice. All-In has them
+  (`scripts/migrate_allin.py` builds the file).
 
 | Command | Purpose |
 | --- | --- |
-| `library-update` | The daily pipeline: `refresh --latest 5` (retried up to 3 times) → the shows' pending and failed episodes (oldest first, at most 100 per show), each in its own `media-asr-remote run --ids <id> --language <show language> --diarize --diarization-backend pyannote`, `--jobs` at a time → `media-asr-remote rediarize` → `enrich` → `correct-terms` → `stats`. Exits 1 if any feed, episode or step failed, after doing all the work it could; every step is idempotent, so a failed run can be re-run as is (`--latest`, `--workers`, `--jobs`) |
+| `library-update` | The daily pipeline: `refresh --latest 5` (retried up to 3 times) → the shows' pending and failed episodes (oldest first, at most 100 per show), each in its own `media-asr-remote run --ids <id> --language <show language> --diarize --diarization-backend pyannote`, `--jobs` at a time → `media-asr-remote rediarize` → `media-asr-remote voiceprint` (if a show has voiceprints) → `enrich` → `correct-terms` → `stats`. Exits 1 if any feed, episode or step failed, after doing all the work it could; every step is idempotent, so a failed run can be re-run as is (`--latest`, `--workers`, `--jobs`) |
 | `rediarize` | When one speaker label holds more than 75% of the speaking time (`--share`), DeepSeek checks whether it merges several people; hard merges (over 90%) and episodes with 3+ people are transcribed again on the GPU with that many speakers plus one. The check, the re-run and the marker of an episode happen under one hold of its lock, in this process, so run it as `media-asr-remote rediarize` to reach the GPU host (`--dry-run`, `--shard i/n`; `--workers N` runs the model checks N at a time, re-runs still go one at a time) |
-| `enrich` | Punctuation and speaker names (`--ids`, `--force`, `--limit`, `--workers`, `--chunk-workers`) |
+| `voiceprint` | For shows with `voiceprints`: the GPU host embeds each diarized segment with pyannote's speaker-embedding model (under the GPU lock); a label whose mean voice scores at least 0.65 against a reference and 0.10 above the next (0.75 / 0.20 under 30 s of speech; labels under 15 s are not judged) is that person. Run it as `media-asr-remote voiceprint` (`--ids`, `--force`) |
+| `enrich` | Punctuation and speaker names; in episodes with `voiceprint.json`, names matched by voice are kept and the model is asked only about the other labels, and a model name that is a reference voice the label does not sound like is rejected (`--ids`, `--force`, `--limit`, `--workers`, `--chunk-workers`) |
 | `correct-terms` | Audited correction of misheard names and terms (`--ids`, `--force`, `--workers`) |
 
 `library-update` chooses the GPU host by `media-asr-remote` env file:
@@ -285,6 +291,8 @@ Files per episode:
 items/<id>/
   transcript.*         # ASR + diarization (SPEAKER_00 labels); rewritten only by run
   rediarize.json       # merged-speaker check: label, share before/after, verdict
+  voiceprint.json      # shows with voiceprints: per label match / no-match / insufficient,
+                       #   closest reference, score, margin, seconds, mean voice
   transcript_named.*   # punctuated, speakers named, terms corrected; indexed for search
   named_base.json      # punctuated and named segments before term correction
   enrich.json          # punctuated segment count, each speaker name with its evidence
@@ -292,9 +300,10 @@ items/<id>/
   .lock                # held while a step writes this episode
 ```
 
-`rediarize.json`, `enrich.json` and `terms.json` are completion markers: each
-step skips items that have its marker. `run` removes all three before it writes
-a new transcript, and `enrich` removes `terms.json`, so later steps run again.
+`rediarize.json`, `voiceprint.json`, `enrich.json` and `terms.json` are
+completion markers: each step skips items that have its marker. `run` removes
+all four before it writes a new transcript, `voiceprint` removes `enrich.json`
+and `terms.json`, and `enrich` removes `terms.json`, so later steps run again.
 A step writes an episode's files and index rows while holding `items/<id>/.lock`,
 after checking that its input has not changed since it was read, and removes
 its own marker before overwriting anything, so an interrupted write is redone on

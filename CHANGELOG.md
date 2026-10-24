@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.0.4 — 2026-10-24
+
+All-In is the ninth show of the podcast library; its voiceprint naming became a
+library step for any show with reference voices.
+
+- `library.toml`: optional `voiceprints = "<file>"` per show (reference voices,
+  relative to the data directory). `docs/examples/podcast-library.toml` adds
+  All-In (`en`; hosts Jason Calacanis, Chamath Palihapitiya, David Sacks, David
+  Friedberg; `voiceprints/all-in.npz`), transcribed with diarization in one pass
+  like the other shows.
+- `media-asr voiceprint` (run as `media-asr-remote voiceprint`; `library-update`
+  runs it between rediarize and enrich when a show has voiceprints): the GPU
+  host embeds each diarized segment with pyannote 3.1's speaker-embedding model,
+  under the GPU lock, in a job of its own (`"kind": "embed"`); each speaker
+  label's mean voice is scored against the references with the rules of the
+  All-In `voiceprint_relabel.py`, and `voiceprint.json` records per label match /
+  no-match / insufficient with the closest reference, score, margin, seconds and
+  mean voice, plus the SHA-256 of the transcript it judged. It is a step marker:
+  `run` drops it, the step redoes a changed transcript, writing it drops
+  `enrich.json` and `terms.json`.
+- `enrich`: names matched by voice are kept (`"method": "voiceprint"`; host if
+  the show's hosts list the name, else guest) and the model is asked only about
+  the other labels, with the known ones listed; a model name that is a reference
+  voice the label does not sound like is rejected (`Speaker N`). Episodes
+  without `voiceprint.json` are named exactly as before.
+- `scripts/migrate_allin.py` moves the All-In archive (`data/`) into the
+  library, keeping ids: diarized transcripts, database rows and segments, the
+  feed, `voiceprint.json` computed from the archived embeddings, and the
+  reference voices built from the archive. Dry run by default, `--apply`
+  idempotent; the archive is only read. On a copy of the live directories: 108
+  episodes, 19,029 segments, all 534 voice decisions as in the archive's final
+  speaker maps; with the archive's own model names replayed, 99.7% of the speaking
+  time gets the same speaker name (the rest is placeholder wording).
+- Retired, as their work is now the library's: `scripts/podcast_daily.sh`,
+  `diarize_existing.py`, `map_speakers.py`, `repair_speakers.py`,
+  `voiceprint_relabel.py`, `embed_speakers.py`, `embed_speakers_worker.py`,
+  `speaker_common.py`, `normalize_names.py`, `run_diarize_2026.sh`.
+- Tests no longer leave an empty `items/` lock directory in the real data
+  directory (`test_run_filter`).
+
 ## 0.0.3 — 2026-10-24
 
 One GPU host, kept busy: several remote jobs share it and take turns on its GPU.

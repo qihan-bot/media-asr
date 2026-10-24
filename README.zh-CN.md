@@ -229,17 +229,22 @@ name = "Latent Space"                               # 可选，用于日志
 feed = "https://api.substack.com/feed/podcast/1084089.rss"
 language = "en"                                     # zh 或 en
 hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # 可选
+voiceprints = "voiceprints/latent-space.npz"        # 可选
 ```
 
 - `feed`：用 `add` 订阅时的 RSS 地址；节目条目的 feed 地址包含这段文字即归入该节目。
 - `language`：Whisper 转写语言，同时决定补标点用的提示词。
 - `hosts`：很少在节目里报自己名字的常驻主持人，作为说话人识别的背景信息。
+- `voiceprints`：常驻说话人的参考声纹（`.npz`，相对数据目录）。配置后该节目每期都会经过
+  `voiceprint`，声音与参考声纹吻合的说话人按声纹命名。All-In 配了它
+  （由 `scripts/migrate_allin.py` 生成）。
 
 | 命令 | 用途 |
 | --- | --- |
-| `library-update` | 每日流程：`refresh --latest 5`（失败最多重试 3 次）→ 各档节目待处理和失败的单期（从旧到新，每档最多 100 期），每期单独通过 `media-asr-remote` 执行 `run --ids <id> --language <节目语言> --diarize --diarization-backend pyannote`，同时最多 `--jobs` 期 → `media-asr-remote rediarize` → `enrich` → `correct-terms` → `stats`。任何 feed、单期或步骤失败时，做完能做的部分后以 1 退出；每一步都幂等，失败后可原样重跑（`--latest`、`--workers`、`--jobs`） |
+| `library-update` | 每日流程：`refresh --latest 5`（失败最多重试 3 次）→ 各档节目待处理和失败的单期（从旧到新，每档最多 100 期），每期单独通过 `media-asr-remote` 执行 `run --ids <id> --language <节目语言> --diarize --diarization-backend pyannote`，同时最多 `--jobs` 期 → `media-asr-remote rediarize` → `media-asr-remote voiceprint`（有节目配了声纹时）→ `enrich` → `correct-terms` → `stats`。任何 feed、单期或步骤失败时，做完能做的部分后以 1 退出；每一步都幂等，失败后可原样重跑（`--latest`、`--workers`、`--jobs`） |
 | `rediarize` | 某个说话人标签占说话时长超过 75%（`--share`）时，由 DeepSeek 判断是否混入了多人；严重合并（超过 90%）或 3 人以上的节目，在 GPU 上按“人数 + 1”重新转写分离。同一期的检查、重跑和完成标记都在这个进程里、持有同一把锁完成，所以要用 `media-asr-remote rediarize` 运行以连上 GPU 主机（`--dry-run`、`--shard i/n`；`--workers N` 让模型判断 N 期并行，重跑仍逐期进行） |
-| `enrich` | 补标点、识别说话人姓名（`--ids`、`--force`、`--limit`、`--workers`、`--chunk-workers`） |
+| `voiceprint` | 配了 `voiceprints` 的节目：GPU 主机用 pyannote 的说话人嵌入模型为每个分离片段算声纹（持 GPU 锁）；某标签的平均声纹与某个参考的相似度不低于 0.65、且比第二名高 0.10（说话不足 30 秒时为 0.75 / 0.20；不足 15 秒不判断），就认定是此人。用 `media-asr-remote voiceprint` 运行（`--ids`、`--force`） |
+| `enrich` | 补标点、识别说话人姓名；有 `voiceprint.json` 的节目，按声纹认出的姓名直接采用，只让模型判断其余标签，模型给出的参考声纹人名若与该标签的声音不符则不采用（`--ids`、`--force`、`--limit`、`--workers`、`--chunk-workers`） |
 | `correct-terms` | 可审计的人名 / 术语纠错（`--ids`、`--force`、`--workers`） |
 
 `library-update` 按 `media-asr-remote` 的 env 文件选择 GPU 主机：`--gpu-env`
@@ -264,6 +269,8 @@ Whisper 一直持有到 pyannote 结束，见
 items/<id>/
   transcript.*         # 转写 + 说话人分离（SPEAKER_00 标签）；只有 run 会重写
   rediarize.json       # 合并检查：标签、前后占比、判断结果
+  voiceprint.json      # 配了声纹的节目：每个标签的 match / no-match / insufficient、
+                       #   最接近的参考、得分、差距、秒数、平均声纹
   transcript_named.*   # 补标点、标姓名、术语纠错后的文稿；检索索引指向它
   named_base.json      # 术语纠错前的补标点、标姓名片段
   enrich.json          # 补标点的片段数、每个说话人姓名及依据
@@ -271,9 +278,9 @@ items/<id>/
   .lock                # 某一步写这期文件时持有的锁
 ```
 
-`rediarize.json`、`enrich.json`、`terms.json` 是完成标记：每一步跳过已有自己
-标记的条目。`run` 写新转写之前会删除这三个标记，`enrich` 会删除 `terms.json`，
-后续步骤因此会重新执行。每一步写某期的文件和索引时都持有 `items/<id>/.lock`，
+`rediarize.json`、`voiceprint.json`、`enrich.json`、`terms.json` 是完成标记：每一步
+跳过已有自己标记的条目。`run` 写新转写之前会删除这四个标记，`voiceprint` 会删除
+`enrich.json` 和 `terms.json`，`enrich` 会删除 `terms.json`，后续步骤因此会重新执行。每一步写某期的文件和索引时都持有 `items/<id>/.lock`，
 先确认输入自读取后没有变化，并在覆盖任何文件之前删除自己的标记，所以写到一半
 中断的条目会在下次运行时重做。`library-update` 持有数据目录下的
 `.library-update.lock`，同时启动的第二个更新会以 1 退出。

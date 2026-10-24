@@ -1,6 +1,6 @@
 [project]
 name = "media-asr"
-version = "0.0.3"
+version = "0.0.4"
 description = "Local-first speech-to-text for videos and podcasts"
 readme = "README.md"
 license = { text = "MIT" }
@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Podcast library term correction (media-asr correct-terms).
-library = ["wordfreq", "jieba", "pypinyin"]
+# Podcast library: term correction (correct-terms) and voiceprints (voiceprint).
+library = ["wordfreq", "jieba", "pypinyin", "numpy"]
 
 [project.urls]
 Homepage = "https://github.com/qihan-bot/media-asr"
