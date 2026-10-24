@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("wordfreq")
+pytest.importorskip("pypinyin")
 from media_asr import llm  # noqa: E402
 from media_asr import terms as C  # noqa: E402
 from media_asr.db import Segment, Store  # noqa: E402
@@ -27,6 +28,17 @@ SPEAKERS = {"罗福莉", "张小珺", "泓君"}
         ("skew", "SKU", False),  # common English word
         ("Junark", "SF Compute", False),  # does not sound alike
         ("OE", "o1", False),  # short token, too loose
+        # pinyin: every character pair needs a toneless similarity >= 0.4
+        ("余昊", "宇树", False),  # hao / shu 0.33
+        ("人物智能", "具身智能", False),  # ren / ju 0.0
+        ("巨声", "具身", True),  # sheng / shen 0.89
+        ("冷量运输", "冷链运输", True),  # liang / lian 0.89
+        ("付费一变不强", "付费意愿不强", True),  # bian / yuan 0.5
+        ("舍负千科", "舍甫琴科", True),  # qian / qin 0.86
+        # English spelling similarity >= 0.55 (was 0.5)
+        ("Codecs", "Claude Code", False),  # 0.5
+        ("Druckner", "Druckenmiller", True),  # 0.76
+        ("Chairpoint", "Checkpoint", True),  # 0.7
     ],
 )
 def test_sound_problem(wrong: str, right: str, ok: bool) -> None:
@@ -34,7 +46,8 @@ def test_sound_problem(wrong: str, right: str, ok: bool) -> None:
 
 
 def test_sound_problem_reasons() -> None:
-    assert C.sound_problem("Junark", "SF Compute", SPEAKERS, "high") == "spelling too different"
+    assert C.sound_problem("余昊", "宇树", SPEAKERS, "high") == "pinyin too different"
+    assert C.sound_problem("Codecs", "Claude Code", SPEAKERS, "high") == "spelling too different"
     assert C.sound_problem("小俊", "张小珺", SPEAKERS, "high") == (
         "Chinese pair changes the syllable count"
     )
@@ -42,6 +55,14 @@ def test_sound_problem_reasons() -> None:
         "mixed-script pair without high confidence"
     )
     assert C.sound_problem("GPT五", "GPT-5", SPEAKERS, "high") is None
+
+
+def test_pinyin_rule_uses_every_reading_and_only_chinese_pairs() -> None:
+    assert {"pu", "piao"} <= C.readings("朴")
+    # pypinyin reads 质朴 in context as "zhi piao"; 智谱 (Zhipu) is "zhi pu".
+    assert not C.pinyin_mismatch("质朴", "智谱")
+    assert not C.pinyin_mismatch("第3代", "第三代")  # the digit is not compared
+    assert C.pinyin_mismatch("余昊", "宇树")
 
 
 def test_select_tiers_and_filters() -> None:

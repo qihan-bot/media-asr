@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Podcast library term correction (media-asr correct-terms).
-library = ["wordfreq", "jieba"]
+library = ["wordfreq", "jieba", "pypinyin"]
 
 [project.urls]
 Homepage = "https://github.com/qihan-bot/media-asr"

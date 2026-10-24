@@ -8,20 +8,22 @@ replacements, recording every pair and its count in ``terms.json``.
 A pair is applied only if ``wrong`` occurs verbatim in the transcript, sounds
 like a mishearing of ``right``, and has a basis:
 
-* sound: a Chinese pair keeps its character (syllable) count; an English pair
-  keeps a spelling similarity of at least 0.5 (0.65 for tokens of four
-  characters or fewer); and ``wrong`` is not a common
-  word (wordfreq Zipf >= 3.5 zh / 3.0 en, so "福利" or "skew" is never
-  replaced), unless ``right`` is a speaker's name of the same length (a
-  misheard self-introduction such as "红军" -> "泓君"). Mixed Chinese/English
-  pairs need high confidence.
+* sound: a Chinese pair keeps its character (syllable) count and every
+  character pair sounds alike (toneless pinyin similarity of at least 0.4 for
+  some reading of each character, so "余昊" -> "宇树" is rejected and
+  "巨声" -> "具身" kept); an English pair keeps
+  a spelling similarity of at least 0.55 (0.65 for tokens of four characters
+  or fewer); and ``wrong`` is not a common word (wordfreq Zipf >= 3.5 zh /
+  3.0 en, so "福利" or "skew" is never replaced), unless ``right`` is a
+  speaker's name of the same length (a misheard self-introduction such as
+  "红军" -> "泓君"). Mixed Chinese/English pairs need high confidence.
 * tier ``reference``: ``right`` appears in the episode's show notes, the show's
   episode titles, or the speaker names (high or medium confidence); or
 * tier ``model``: a widely known name or term the model rates high confidence.
 
 Pairs that map one ``wrong`` to two different forms, or whose ``wrong`` is
 under two characters, are dropped. ASCII ``wrong`` forms match whole words only.
-Needs the ``library`` extras (wordfreq, jieba).
+Needs the ``library`` extras (wordfreq, jieba, pypinyin).
 
 Input is ``named_base.json`` (punctuated, named, uncorrected; written by
 ``enrich``); output is ``transcript_named.*`` plus the search index.
@@ -36,8 +38,10 @@ import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 
+from pypinyin import Style, pinyin
 from wordfreq import zipf_frequency
 
 from .config import ITEMS_DIR
@@ -104,18 +108,38 @@ def script_of(text: str) -> str:
     return "en"
 
 
+@lru_cache(maxsize=None)
+def readings(char: str) -> frozenset[str]:
+    """Toneless pinyin readings of a Chinese character, all of them (朴: pu, piao, po);
+    a reading guessed from context is sometimes wrong (质朴 as "zhi piao")."""
+    return frozenset(pinyin(char, style=Style.NORMAL, heteronym=True)[0])
+
+
+def pinyin_mismatch(wrong: str, right: str) -> bool:
+    """True if a Chinese character pair of two same-length strings sounds unlike:
+    no reading of one is within 0.4 (difflib ratio) of a reading of the other."""
+    return any(
+        max(SequenceMatcher(None, a, b).ratio() for a in readings(w) for b in readings(r)) < 0.4
+        for w, r in zip(wrong, right)
+        if CJK.match(w) and CJK.match(r)
+    )
+
+
 def sound_problem(wrong: str, right: str, speakers: set[str], confidence) -> str | None:
     """Reason a pair does not look like a mishearing, or None."""
     kinds = {script_of(wrong), script_of(right)}
     if kinds == {"zh"}:
         if len(wrong) != len(right):
             return "Chinese pair changes the syllable count"
+        if pinyin_mismatch(wrong, right):
+            return "pinyin too different"
         if zipf_frequency(wrong, "zh") >= 3.5 and right not in speakers:
             return "wrong form is a common word"
     elif kinds == {"en"}:
         a, b = (re.sub(r"[^a-z0-9]", "", x.lower()) for x in (wrong, right))
-        # Short tokens ("OE", "AME") match almost anything at 0.5.
-        if SequenceMatcher(None, a, b).ratio() < (0.65 if min(len(a), len(b)) <= 4 else 0.5):
+        # Short tokens ("OE", "AME") match almost anything at 0.5; "Codecs" vs
+        # "Claude Code" scores 0.5.
+        if SequenceMatcher(None, a, b).ratio() < (0.65 if min(len(a), len(b)) <= 4 else 0.55):
             return "spelling too different"
         if zipf_frequency(wrong, "en") >= 3.0 and not (right in speakers and len(a) == len(b)):
             return "wrong form is a common word"
