@@ -151,9 +151,17 @@ class Store:
             # A feed that moves hosts (e.g. Substack -> beehiiv) changes every
             # enclosure URL; the same title in the same feed is the same episode.
             row = self.conn.execute(
-                "SELECT id FROM items WHERE feed_url = ? AND title = ?", (feed_url, title)
+                "SELECT id, status FROM items WHERE feed_url = ? AND title = ?", (feed_url, title)
             ).fetchone()
             if row:
+                if row["status"] != "done":
+                    # Not transcribed yet: download from the feed's current address,
+                    # the old one may be gone.
+                    with self.conn:
+                        self.conn.execute(
+                            "UPDATE items SET source = ?, meta_json = ?, updated_at = ? WHERE id = ?",
+                            (source, meta_json, now_iso(), row["id"]),
+                        )
                 return row["id"], False
 
         new_id = item_id(source)

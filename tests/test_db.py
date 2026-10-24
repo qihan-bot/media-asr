@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from media_asr.db import Segment, Store
@@ -65,3 +66,37 @@ def test_add_item_dedupes_same_title_in_same_feed(tmp_path: Path) -> None:
         feed_url="https://feed.example/other/rss",
     )
     assert created and other != first
+
+
+def test_untranscribed_episode_takes_the_new_download_address(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    feed = "https://show.example/rss"
+    first, _ = store.add_item(
+        source="https://old.example/expired.mp3",
+        source_type="podcast",
+        title="Ep",
+        feed_url=feed,
+        meta_json=json.dumps({"audio_url": "https://old.example/expired.mp3"}),
+    )
+    store.set_status(first, "failed")
+    again, created = store.add_item(
+        source="https://new.example/current.mp3",
+        source_type="podcast",
+        title="Ep",
+        feed_url=feed,
+        meta_json=json.dumps({"audio_url": "https://new.example/current.mp3"}),
+    )
+    row = store.get_item(first)
+    assert (again, created) == (first, False)
+    assert row["source"] == "https://new.example/current.mp3"
+    assert json.loads(row["meta_json"])["audio_url"] == "https://new.example/current.mp3"
+    assert row["status"] == "failed"  # still retried by run --retry-failed
+    # A transcribed episode keeps the address it was transcribed from.
+    store.save_result(
+        first, segments=[], duration=1.0, language="en", model="m", transcript_path="t.md"
+    )
+    store.add_item(
+        source="https://newer.example/x.mp3", source_type="podcast", title="Ep", feed_url=feed
+    )
+    assert store.get_item(first)["source"] == "https://new.example/current.mp3"
+    store.close()
