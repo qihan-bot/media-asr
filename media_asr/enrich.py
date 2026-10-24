@@ -10,7 +10,12 @@ For every done item that has no ``enrich.json`` yet:
    the recurring hosts from ``library.toml``, the episode title, the RSS show
    notes and the transcript. Only high/medium confidence names are used; the
    rest become ``主持人N`` / ``Host N``, ``嘉宾N`` / ``Guest N`` or
-   ``说话人N`` / ``Speaker N``.
+   ``说话人N`` / ``Speaker N``. In an episode with ``voiceprint.json`` (shows
+   with reference voices), labels whose voice matched a reference keep that
+   name (``"method": "voiceprint"``; role host if the show's hosts list the
+   name, else guest) and the model is asked only about the other labels; a
+   model name that is one of the reference voices but not what the label
+   sounds like is rejected.
 
 Writes ``transcript_named.{md,srt,txt,json}``, ``named_base.json`` (the input
 of ``correct-terms``) and ``enrich.json`` (the completion marker) next to the
@@ -42,6 +47,7 @@ from .library import (
 )
 from .llm import LLM
 from .util import atomic_write, item_lock, now_iso
+from .voiceprint import voices
 
 CHUNK_CHARS = {"zh": 2500, "en": 6000}
 
@@ -95,6 +101,13 @@ use null for the name.
 
 Return only JSON:
 {{"speakers": {{"SPEAKER_00": {{"name": "...", "role": "host", "confidence": "high", "evidence": "short reason"}}}}}}
+"""
+
+# Appended to SPEAKER_PROMPT when voiceprints named some labels.
+VOICE_NOTE = """
+Already identified by voice; keep these and do not label them again:
+{known}
+Label only: {ask}
 """
 
 
@@ -189,35 +202,66 @@ def enrich_item(
         seg["text"] = text
 
     labels = sorted({s["speaker"] for s in segments if s.get("speaker")})
+    voice = voices(items_dir / row["id"], digest) or {}
+    sounds = voice.get("speakers", {})
+    heard = {
+        label: sounds[label] for label in labels if sounds.get(label, {}).get("voice") == "match"
+    }
+    roster = set(voice.get("references", []))
+    hosts = host_hints(shows, row["feed_url"])
     names: dict[str, dict] = {}
     if labels:
-        stats, excerpt = speaker_context(segments)
-        prompt = SPEAKER_PROMPT.format(
-            show=titles.get(row["feed_url"], row["feed_url"] or ""),
-            hosts=host_hints(shows, row["feed_url"]) or "(not given)",
-            title=row["title"],
-            notes=episode_notes(notes, row),
-            stats=stats,
-            transcript=excerpt,
-        )
-        raw = llm.chat("You label podcast speakers. Output valid JSON only.", prompt, 2000)
-        raw = raw.get("speakers", raw)
+        ask = [label for label in labels if label not in heard]
+        raw: dict = {}
+        if ask:
+            stats, excerpt = speaker_context(segments)
+            prompt = SPEAKER_PROMPT.format(
+                show=titles.get(row["feed_url"], row["feed_url"] or ""),
+                hosts=hosts or "(not given)",
+                title=row["title"],
+                notes=episode_notes(notes, row),
+                stats=stats,
+                transcript=excerpt,
+            )
+            if heard:
+                known = "\n".join(f"{label}: {heard[label]['name']}" for label in sorted(heard))
+                prompt += VOICE_NOTE.format(known=known, ask=", ".join(ask))
+            raw = llm.chat("You label podcast speakers. Output valid JSON only.", prompt, 2000)
+            raw = raw.get("speakers", raw)
         unknown: dict[str, int] = {}
         for label in labels:
+            if label in heard:
+                match = heard[label]
+                names[label] = {
+                    "name": match["name"],
+                    "role": "host" if match["name"] in hosts else "guest",
+                    "confidence": match["confidence"],
+                    "evidence": f"voiceprint {match['score']:.2f} (margin {match['margin']:.2f})",
+                    "method": "voiceprint",
+                }
+                continue
             info = raw.get(label) or {}
             name = (info.get("name") or "").strip() if isinstance(info, dict) else ""
             confidence = info.get("confidence", "low") if isinstance(info, dict) else "low"
+            role = info.get("role") if isinstance(info, dict) else None
+            evidence = info.get("evidence", "") if isinstance(info, dict) else ""
+            sound = sounds.get(label, {})
+            if name in roster and sound.get("voice") == "no-match" and sound.get("best") != name:
+                evidence = (
+                    f"voice does not match {name} (closest {sound['best']} {sound['score']:.2f}); "
+                    "model name rejected"
+                )
+                name, confidence, role = "", "low", "other"
             if not name or confidence not in ("high", "medium"):
-                role = info.get("role") if isinstance(info, dict) else None
-                role = role if role in ("host", "guest") else "other"
-                unknown[role] = unknown.get(role, 0) + 1
+                kind = role if role in ("host", "guest") else "other"
+                unknown[kind] = unknown.get(kind, 0) + 1
                 sep = "" if lang == "zh" else " "
-                name = f"{UNNAMED[lang][role]}{sep}{unknown[role]}"
+                name = f"{UNNAMED[lang][kind]}{sep}{unknown[kind]}"
             names[label] = {
                 "name": name,
-                "role": info.get("role") if isinstance(info, dict) else None,
+                "role": role,
                 "confidence": confidence,
-                "evidence": info.get("evidence", "") if isinstance(info, dict) else "",
+                "evidence": evidence,
             }
         for seg in segments:
             if seg.get("speaker") in names:

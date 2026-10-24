@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from media_asr import enrich as E
 from media_asr import voiceprint as V
 from media_asr.db import Store
 from media_asr.library import Show, file_digest
@@ -288,3 +289,119 @@ def test_an_episode_without_speaker_labels_is_skipped(library) -> None:
     transcript.write_text(json.dumps(data))
     embed = Embedder()
     assert run(store, items_dir, data_dir, embed) == 0 and embed.calls == []
+
+
+# --- enrich with voiceprints -------------------------------------------------------------
+
+
+class Namer:
+    """Echo punctuation; names labels as given, recording the speaker prompts."""
+
+    model = "fake"
+
+    def __init__(self, names: dict) -> None:
+        self.names, self.prompts = names, []
+
+    def chat(self, system: str, user: str, max_tokens: int) -> dict:
+        if "label podcast speakers" in system:
+            self.prompts.append(user)
+            return {"speakers": {k: dict(v) for k, v in self.names.items()}}
+        return {"lines": user.split("\n")}
+
+
+def voiced(library) -> tuple:
+    store, items_dir, data_dir = library
+    item = episode(store, items_dir, 1)
+    assert run(store, items_dir, data_dir, Embedder()) == 0
+    return store, items_dir, item
+
+
+def named(items_dir: Path, item: str) -> dict:
+    return json.loads((items_dir / item / "enrich.json").read_text())["speakers"]
+
+
+def test_enrich_keeps_voiceprint_names_and_asks_only_about_the_rest(library) -> None:
+    store, items_dir, item = voiced(library)
+    llm = Namer(
+        {
+            "SPEAKER_00": {"name": "B Host", "confidence": "high"},  # ignored: matched by voice
+            "SPEAKER_01": {"name": "Carol Guest", "role": "guest", "confidence": "high"},
+            "SPEAKER_02": {"name": None, "role": "other", "confidence": "low"},
+        }
+    )
+    assert E.run(store.conn, llm, [SHOW], items_dir=items_dir) == 0
+    (prompt,) = llm.prompts
+    assert prompt.endswith(
+        "Already identified by voice; keep these and do not label them again:\n"
+        "SPEAKER_00: A Host\nLabel only: SPEAKER_01, SPEAKER_02\n"
+    )
+    speakers = named(items_dir, item)
+    assert speakers["SPEAKER_00"] == {
+        "name": "A Host",
+        "role": "host",
+        "confidence": "high",
+        "evidence": "voiceprint 1.00 (margin 0.95)",
+        "method": "voiceprint",
+    }
+    assert (
+        speakers["SPEAKER_01"]["name"] == "Carol Guest" and "method" not in speakers["SPEAKER_01"]
+    )
+    assert speakers["SPEAKER_02"]["name"] == "Speaker 1"
+    lines = json.loads((items_dir / item / "transcript_named.json").read_text())["segments"]
+    assert [s["speaker"] for s in lines] == ["A Host", "Carol Guest", "Speaker 1"]
+
+
+def test_enrich_rejects_a_reference_name_the_voice_contradicts(library) -> None:
+    store, items_dir, item = voiced(library)
+    # SPEAKER_01 sounds like nobody in the references (closest: B Host, 0.10).
+    llm = Namer({"SPEAKER_01": {"name": "A Host", "role": "host", "confidence": "high"}})
+    assert E.run(store.conn, llm, [SHOW], items_dir=items_dir) == 0
+    rejected = named(items_dir, item)["SPEAKER_01"]
+    assert rejected["name"] == "Speaker 1" and rejected["role"] == "other"
+    assert rejected["evidence"] == (
+        "voice does not match A Host (closest B Host 0.10); model name rejected"
+    )
+
+
+def test_enrich_keeps_a_reference_name_the_voice_leans_to(library) -> None:
+    store, items_dir, item = voiced(library)
+    # SPEAKER_01 matches nobody, but leans to B Host: the model's B Host stands.
+    llm = Namer({"SPEAKER_01": {"name": "B Host", "role": "host", "confidence": "medium"}})
+    assert E.run(store.conn, llm, [SHOW], items_dir=items_dir) == 0
+    assert named(items_dir, item)["SPEAKER_01"]["name"] == "B Host"
+    # A label with too little speech is not judged by voice: the model's name stands.
+    llm = Namer({"SPEAKER_02": {"name": "B Host", "role": "host", "confidence": "high"}})
+    assert E.run(store.conn, llm, [SHOW], force=True, items_dir=items_dir) == 0
+    assert named(items_dir, item)["SPEAKER_02"]["name"] == "B Host"
+
+
+def test_enrich_skips_the_model_when_every_label_is_known(library) -> None:
+    store, items_dir, item = voiced(library)
+    path = items_dir / item / "voiceprint.json"
+    marker = json.loads(path.read_text())
+    for rec in marker["speakers"].values():
+        rec.update(voice="match", name="B Host", confidence="medium", score=0.7, margin=0.2)
+    path.write_text(json.dumps(marker))
+    llm = Namer({})
+    assert E.run(store.conn, llm, [SHOW], items_dir=items_dir) == 0
+    assert llm.prompts == []
+    assert {s["name"] for s in named(items_dir, item).values()} == {"B Host"}
+
+
+def test_enrich_refuses_a_voiceprint_of_another_transcript(library, capsys) -> None:
+    store, items_dir, item = voiced(library)
+    transcript = items_dir / item / "transcript.json"
+    transcript.write_text(transcript.read_text().replace("hello there", "hello here"))
+    assert E.run(store.conn, Namer({}), [SHOW], items_dir=items_dir) == 1
+    assert not (items_dir / item / "enrich.json").exists()
+    assert "voiceprint.json is for another transcript" in capsys.readouterr().out
+
+
+def test_enrich_without_voiceprints_asks_as_before(library) -> None:
+    store, items_dir, data_dir = library
+    item = episode(store, items_dir, 1)
+    llm = Namer({"SPEAKER_00": {"name": "B Host", "role": "host", "confidence": "high"}})
+    assert E.run(store.conn, llm, [SHOW], items_dir=items_dir) == 0
+    (prompt,) = llm.prompts
+    assert "identified by voice" not in prompt and prompt.endswith('"short reason"}}}\n')
+    assert named(items_dir, item)["SPEAKER_00"]["name"] == "B Host"
