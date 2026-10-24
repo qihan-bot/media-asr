@@ -36,13 +36,19 @@ OLD_HOSTS = {
 }
 
 
-def test_example_config_has_the_old_hard_coded_shows() -> None:
+def test_example_config_has_the_old_hard_coded_shows_and_all_in() -> None:
     shows = L.load_shows(EXAMPLE)
-    assert len(shows) == len(OLD_SHOWS)
+    assert len(shows) == len(OLD_SHOWS) + 1
     for fragment, language in OLD_SHOWS.items():
         (show,) = [s for s in shows if fragment in s.feed]
         assert show.language == language
         assert L.host_hints(shows, show.feed) == OLD_HOSTS.get(fragment, "")
+        assert not show.voiceprints
+    (all_in,) = [s for s in shows if s.matches("https://allinchamathjason.libsyn.com/rss")]
+    assert (all_in.language, all_in.voiceprints) == ("en", "voiceprints/all-in.npz")
+    # The four hosts of scripts/map_speakers.py (the All-In speaker naming before 0.0.4).
+    for host in ("Jason Calacanis", "Chamath Palihapitiya", "David Sacks", "David Friedberg"):
+        assert host in all_in.hosts
 
 
 def write(tmp_path: Path, text: str) -> Path:
@@ -65,6 +71,7 @@ def write(tmp_path: Path, text: str) -> Path:
             "unknown keys ['host']",
         ),
         ('[[show]]\nfeed = "https://a/rss"\nlanguage = "zh"\nhosts = ["A"]\n', "must be strings"),
+        ('[[show]]\nfeed = "https://a/rss"\nlanguage = "zh"\nvoiceprints = 1\n', "must be strings"),
         (
             '[[show]]\nfeed = "https://a/feed"\nlanguage = "zh"\n'
             '[[show]]\nfeed = "https://a/feed2"\nlanguage = "en"\n',
@@ -87,12 +94,12 @@ def test_show_fields_and_matching(tmp_path: Path) -> None:
     path = write(
         tmp_path,
         '[[show]]\nname = " A "\nfeed = " https://a/rss "\nlanguage = "zh"\nhosts = "Ann"\n'
-        '[[show]]\nfeed = "https://b/rss"\nlanguage = "en"\n',
+        '[[show]]\nfeed = "https://b/rss"\nlanguage = "en"\nvoiceprints = " v/b.npz "\n',
     )
     shows = L.load_shows(path)
     assert shows == [
         L.Show(feed="https://a/rss", language="zh", name="A", hosts="Ann"),
-        L.Show(feed="https://b/rss", language="en"),
+        L.Show(feed="https://b/rss", language="en", voiceprints="v/b.npz"),
     ]
     assert L.host_hints(shows, "https://a/rss") == "Ann"
     assert L.host_hints(shows, "https://b/rss") == ""
@@ -389,3 +396,18 @@ def test_library_update_passes_jobs_and_workers(monkeypatch) -> None:
 def test_job_and_worker_counts_must_be_at_least_one(argv: list[str]) -> None:
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(argv)
+
+
+def test_the_voiceprint_step_runs_between_rediarize_and_enrich(store: Store) -> None:
+    voiced = [SHOWS[0], L.Show(feed="https://b/rss", language="en", voiceprints="v/b.npz")]
+    shell = FakeShell()
+    assert L.update(store, voiced, gpu_env="a.env", shell=shell, sleep=None) == 0
+    assert shell.names()[-5:] == ["rediarize", "voiceprint", "enrich", "correct-terms", "stats"]
+    assert ("voiceprint", "a.env") in shell.calls
+    # Without a GPU host it is skipped like rediarize; without voiceprints it is not there.
+    shell = FakeShell(ok_envs=())
+    assert L.update(store, voiced, gpu_env="a.env", shell=shell, sleep=None) == 1
+    assert "voiceprint" not in shell.names()
+    shell = FakeShell()
+    assert L.update(store, SHOWS, gpu_env="a.env", shell=shell, sleep=None) == 0
+    assert "voiceprint" not in shell.names()

@@ -191,6 +191,7 @@ def test_a_new_transcript_makes_later_steps_run_again(tmp_path: Path, monkeypatc
     )
     assert E.run(store.conn, Punctuator(), [], items_dir=items_dir) == 0
     (items_dir / item / "terms.json").write_text("{}")  # as if corrected
+    (items_dir / item / "voiceprint.json").write_text("{}")  # as if voiceprinted
     monkeypatch.setattr(cli, "ITEMS_DIR", items_dir)
     remote = FakeRemote(fail=True)
     monkeypatch.setattr(cli.RemoteGPU, "from_args", lambda args: remote)
@@ -208,7 +209,7 @@ def test_a_new_transcript_makes_later_steps_run_again(tmp_path: Path, monkeypatc
     assert store.get_item(item)["status"] == "failed"
     assert not [
         m
-        for m in ("rediarize.json", "enrich.json", "terms.json")
+        for m in ("rediarize.json", "voiceprint.json", "enrich.json", "terms.json")
         if (items_dir / item / m).exists()
     ]
     # The daily retry transcribes it again; every later step then runs on the new transcript.

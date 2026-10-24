@@ -8,6 +8,8 @@
 #   name      optional, for logs
 #   hosts     optional: recurring hosts who rarely say their own names on air,
 #             given to the speaker-naming prompt as context
+#   voiceprints  optional: reference voices (.npz, relative to the data directory);
+#             `media-asr voiceprint` names the speakers whose voice matches one
 
 [[show]]
 name = "硅谷101"
@@ -51,3 +53,10 @@ name = "Robot Talk"
 feed = "https://rss.libsyn.com/shows/292433/destinations/2292818.xml"
 language = "en"
 hosts = "Claire Asher"
+
+[[show]]
+name = "All-In"
+feed = "https://allinchamathjason.libsyn.com/rss"
+language = "en"
+hosts = "Jason Calacanis, Chamath Palihapitiya, David Sacks and David Friedberg"
+voiceprints = "voiceprints/all-in.npz"

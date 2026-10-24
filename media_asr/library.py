@@ -8,6 +8,7 @@ A podcast library is a data directory (``MEDIA_ASR_DATA``) whose
     feed = "https://api.substack.com/feed/podcast/1084089.rss"
     language = "en"                           # zh or en
     hosts = "swyx and Alessio Fanelli"        # optional speaker-naming hint
+    voiceprints = "voiceprints/show.npz"      # optional reference voices (media-asr voiceprint)
 
 An episode belongs to a show when its feed URL contains ``feed``; use the URL
 the feed was subscribed with (``media-asr add <feed> --latest N``).
@@ -44,10 +45,10 @@ ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / "media-asr-remote"
 MEDIA_ASR = [sys.executable, "-m", "media_asr"]
 LANGUAGES = ("zh", "en")
-SHOW_KEYS = {"name", "feed", "language", "hosts"}
+SHOW_KEYS = {"name", "feed", "language", "hosts", "voiceprints"}
 # Completion markers of the steps built on transcript.json; `media-asr run`
 # drops them before it writes a new transcript, so these steps run again.
-STEP_MARKERS = ("rediarize.json", "enrich.json", "terms.json")
+STEP_MARKERS = ("rediarize.json", "voiceprint.json", "enrich.json", "terms.json")
 # Remote ASR progress lines; dropped from the update log.
 PROGRESS = re.compile(r"frames/s|still running")
 # Episodes per show and update, as `media-asr run --limit` (default 100) did.
@@ -64,6 +65,7 @@ class Show:
     language: str
     name: str = ""
     hosts: str = ""
+    voiceprints: str = ""  # reference voices, relative to the data directory
 
     def matches(self, feed_url: str | None) -> bool:
         return self.feed in (feed_url or "")
@@ -97,14 +99,15 @@ def load_shows(path: Path | None = None, *, missing_ok: bool = False) -> list[Sh
             raise LibraryError(f"{where}: feed (the RSS URL) is required")
         if entry.get("language") not in LANGUAGES:
             raise LibraryError(f"{where}: language must be one of {', '.join(LANGUAGES)}")
-        if any(not isinstance(entry.get(key, ""), str) for key in ("name", "hosts")):
-            raise LibraryError(f"{where}: name and hosts must be strings")
+        if any(not isinstance(entry.get(key, ""), str) for key in ("name", "hosts", "voiceprints")):
+            raise LibraryError(f"{where}: name, hosts and voiceprints must be strings")
         shows.append(
             Show(
                 feed=entry["feed"].strip(),
                 language=entry["language"],
                 name=entry.get("name", "").strip(),
                 hosts=entry.get("hosts", "").strip(),
+                voiceprints=entry.get("voiceprints", "").strip(),
             )
         )
     if not shows:
@@ -317,8 +320,9 @@ def update(
     sleep=time.sleep,
 ) -> int:
     """Daily refresh: feeds -> remote GPU transcription with pyannote
-    diarization, ``jobs`` episodes at a time -> rediarize -> enrich ->
-    correct-terms (``workers`` episodes at a time).
+    diarization, ``jobs`` episodes at a time -> rediarize -> voiceprint (if a
+    show has reference voices) -> enrich -> correct-terms (``workers``
+    episodes at a time).
 
     The GPU host is ``gpu_env`` if it passes ``remote-check``, else
     ``fallback_gpu_env`` if that passes, one episode at a time (its workers may
@@ -405,6 +409,17 @@ def _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, jobs, shel
             "re-diarize episodes where one label merged several people",
             [str(REMOTE), "rediarize", "--workers", str(workers)] if gpu else None,
             PROGRESS,
+        ),
+        *(
+            [
+                (
+                    "voiceprints (shows with reference voices)",
+                    [str(REMOTE), "voiceprint"] if gpu else None,
+                    PROGRESS,
+                )
+            ]
+            if any(show.voiceprints for show in shows)
+            else []
         ),
         ("punctuation + speaker names", [*MEDIA_ASR, "enrich", "--workers", str(workers)], None),
         (

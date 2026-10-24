@@ -235,6 +235,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="model checks in parallel; re-runs go one at a time",
     )
 
+    voiceprint = sub.add_parser(
+        "voiceprint", help="podcast library: name speakers by voice (shows with voiceprints)"
+    )
+    voiceprint.add_argument("--ids", nargs="*", default=None, help="only these item ids")
+    voiceprint.add_argument(
+        "--force", action="store_true", help="redo items that have a current voiceprint.json"
+    )
+
     library = sub.add_parser(
         "library-update",
         help="podcast library: refresh, transcribe, rediarize, enrich, correct-terms",
@@ -304,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_correct_terms(store, args)
         if args.command == "rediarize":
             return cmd_rediarize(store, args)
+        if args.command == "voiceprint":
+            return cmd_voiceprint(store, args)
         if args.command == "library-update":
             return cmd_library_update(store, args)
         if args.command == "feeds":
@@ -1000,6 +1010,30 @@ def _rerun_item(store: Store, item_id: str, language: str, num_speakers: int) ->
     finally:
         remote.close()
     return file_digest(ITEMS_DIR / item_id / "transcript.json")
+
+
+def cmd_voiceprint(store: Store, args: argparse.Namespace) -> int:
+    from . import voiceprint
+    from .library import LibraryError, load_shows
+
+    try:
+        shows = load_shows()
+    except LibraryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    def embed(row, segments: list[dict], fingerprint: str):
+        args = build_parser().parse_args(["run", "--backend", "remote", "--remote-mode", "full"])
+        remote = RemoteGPU.from_args(args)
+        if not remote.host:
+            raise RuntimeError("no remote GPU configured; run it as media-asr-remote voiceprint")
+        remote.connect()
+        try:
+            return remote.run_embed(dict(row), segments, fingerprint, progress=_log)
+        finally:
+            remote.close()
+
+    return voiceprint.run(store.conn, shows, embed=embed, ids=args.ids, force=args.force)
 
 
 def cmd_library_update(store: Store, args: argparse.Namespace) -> int:
