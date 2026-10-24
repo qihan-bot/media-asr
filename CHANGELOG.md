@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.6 — 2026-10-24
+
+`library.toml` is the one place a show is defined, for the site too; the LLM client answers in plain text
+when text is the answer.
+
+- `[[show]]` accepts three optional keys for the site that publishes notes on the shows (qihan.ai reads its
+  show list from this file): `slug` (the show's id: lowercase letters, digits and hyphens, unique across
+  shows), `short` (a short name) and `youtube_channel` (an https URL; the site matches episodes against the
+  channel's uploads). media-asr checks them and does not use them; configs without them load as before.
+- `docs/examples/podcast-library.toml` carries name, slug and short for all nine shows, as the site has
+  published them (All-In's name is now "All-In Podcast"), and All-In's YouTube channel.
+- `LLM.chat_text()`: the answer as plain text, without JSON mode. The DGX server accepts `response_format`
+  but does not enforce it (6 of 14 Markdown sections of a podcast note came back unwrapped), so text answers
+  are asked for as text. Same endpoint check, cap on requests in flight and five attempts as `chat()`; an
+  empty answer is retried. qihan.ai's podcast-note translator uses it.
+
 ## 0.0.5 — 2026-10-24
 
 - Podcast library LLM steps (enrich, correct-terms, rediarize) use the local DeepSeek on the DGX by default

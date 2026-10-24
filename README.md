@@ -241,11 +241,13 @@ example: [docs/examples/podcast-library.toml](docs/examples/podcast-library.toml
 
 ```toml
 [[show]]
-name = "Latent Space"                               # optional, for logs
+name = "Latent Space"                               # optional: logs, and the name on a site
 feed = "https://api.substack.com/feed/podcast/1084089.rss"
 language = "en"                                     # zh or en
 hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # optional
 voiceprints = "voiceprints/latent-space.npz"        # optional
+slug = "latent-space"                               # optional site metadata
+short = "Latent Space"                              # optional site metadata
 ```
 
 - `feed`: the feed URL as subscribed with `add`; an episode belongs to the show
@@ -257,6 +259,11 @@ voiceprints = "voiceprints/latent-space.npz"        # optional
   to the data directory); the show's episodes then go through `voiceprint`, and
   speakers whose voice matches one are named by voice. All-In has them
   (`scripts/migrate_allin.py` builds the file).
+- `slug`, `short`, `youtube_channel`: optional metadata for a site that
+  publishes notes on the shows (qihan.ai reads its show list from this file):
+  the show's id (lowercase letters, digits and hyphens, unique), its short
+  name, and the YouTube channel its episodes are matched against. media-asr
+  only checks them.
 
 | Command | Purpose |
 | --- | --- |

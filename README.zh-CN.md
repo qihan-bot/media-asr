@@ -225,11 +225,13 @@ HF_TOKEN=... LAN_MODEL_API_KEY=... ./media-asr library-update --jobs 3 \
 
 ```toml
 [[show]]
-name = "Latent Space"                               # 可选，用于日志
+name = "Latent Space"                               # 可选，用于日志，也是网站上的节目名
 feed = "https://api.substack.com/feed/podcast/1084089.rss"
 language = "en"                                     # zh 或 en
 hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # 可选
 voiceprints = "voiceprints/latent-space.npz"        # 可选
+slug = "latent-space"                               # 可选，网站元数据
+short = "Latent Space"                              # 可选，网站元数据
 ```
 
 - `feed`：用 `add` 订阅时的 RSS 地址；节目条目的 feed 地址包含这段文字即归入该节目。
@@ -238,6 +240,9 @@ voiceprints = "voiceprints/latent-space.npz"        # 可选
 - `voiceprints`：常驻说话人的参考声纹（`.npz`，相对数据目录）。配置后该节目每期都会经过
   `voiceprint`，声音与参考声纹吻合的说话人按声纹命名。All-In 配了它
   （由 `scripts/migrate_allin.py` 生成）。
+- `slug`、`short`、`youtube_channel`：可选，给发布节目精读的网站用的元数据（qihan.ai
+  的节目列表就读这个文件）：节目 ID（小写字母、数字、连字符，不可重复）、短名，以及用来
+  匹配视频的 YouTube 频道。media-asr 只做校验。
 
 | 命令 | 用途 |
 | --- | --- |
