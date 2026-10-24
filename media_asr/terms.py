@@ -42,12 +42,15 @@ from wordfreq import zipf_frequency
 
 from .config import ITEMS_DIR
 from .library import episode_notes, load_show_notes
-from .llm import LLM
+from .llm import LLM, TruncatedResponse
 from .render import render_all
 from .transcribe import TranscriptSegment
 from .util import atomic_write, now_iso
 
 CHUNK_CHARS = {"zh": 6000, "en": 12000}
+# 3000 cut off the answer for chunks with many fixes; a chunk whose answer is
+# still cut off is split in two and retried.
+MAX_TOKENS = 8000
 CJK = re.compile(r"[一-鿿]")
 
 PROMPT = """You check a podcast transcript produced by speech recognition for misrecognized
@@ -78,15 +81,15 @@ Return only JSON: {{"fixes": [{{"wrong": "...", "right": "...", "basis": "refere
 """
 
 
-def chunks_of(texts: list[str], budget: int) -> list[str]:
+def chunks_of(texts: list[str], budget: int) -> list[list[str]]:
     out, current, size = [], [], 0
     for text in texts:
         if current and size + len(text) > budget:
-            out.append("\n".join(current))
+            out.append(current)
             current, size = [], 0
         current.append(text)
         size += len(text)
-    return out + (["\n".join(current)] if current else [])
+    return out + ([current] if current else [])
 
 
 def pattern(wrong: str) -> re.Pattern:
@@ -169,6 +172,26 @@ def select(
     return accepted, rejected
 
 
+def find_fixes(llm: LLM, lines: list[str], prompt_for, label: str = "") -> list[dict]:
+    """Ask for the fixes in one chunk of lines. An answer cut off at the token
+    limit (too many fixes) splits the chunk in two and asks for each half."""
+    try:
+        result = llm.chat(
+            "You find speech-recognition errors. Output valid JSON only.",
+            prompt_for("\n".join(lines)),
+            MAX_TOKENS,
+        )
+    except TruncatedResponse:
+        if len(lines) < 2:
+            raise
+        print(f"{label}: answer cut off, splitting a chunk of {len(lines)} lines", flush=True)
+        half = len(lines) // 2
+        return find_fixes(llm, lines[:half], prompt_for, label) + find_fixes(
+            llm, lines[half:], prompt_for, label
+        )
+    return [f for f in result.get("fixes", []) if isinstance(f, dict)]
+
+
 def correct_item(row, notes, titles_by_feed, show_titles, llm: LLM, items_dir: Path) -> dict:
     item_dir = items_dir / row["id"]
     named = json.loads((item_dir / "transcript_named.json").read_text(encoding="utf-8"))
@@ -181,9 +204,8 @@ def correct_item(row, notes, titles_by_feed, show_titles, llm: LLM, items_dir: P
     ]
     reference = "\n".join([row["title"], note_text, other_titles, " ".join(speakers)])
 
-    fixes: list[dict] = []
-    for chunk in chunks_of([s["text"] for s in segments], CHUNK_CHARS[lang]):
-        prompt = PROMPT.format(
+    def prompt_for(chunk: str) -> str:
+        return PROMPT.format(
             show=titles_by_feed.get(row["feed_url"], ""),
             title=row["title"],
             speakers=", ".join(speakers) or "(unknown)",
@@ -191,10 +213,10 @@ def correct_item(row, notes, titles_by_feed, show_titles, llm: LLM, items_dir: P
             titles=other_titles or "(none)",
             chunk=chunk,
         )
-        result = llm.chat(
-            "You find speech-recognition errors. Output valid JSON only.", prompt, 3000
-        )
-        fixes.extend(f for f in result.get("fixes", []) if isinstance(f, dict))
+
+    fixes: list[dict] = []
+    for lines in chunks_of([s["text"] for s in segments], CHUNK_CHARS[lang]):
+        fixes.extend(find_fixes(llm, lines, prompt_for, row["id"]))
 
     full_text = "\n".join(s["text"] for s in segments)
     accepted, rejected = select(fixes, full_text, reference, set(speakers))
