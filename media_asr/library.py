@@ -15,6 +15,7 @@ the feed was subscribed with (``media-asr add <feed> --latest N``).
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -32,7 +33,9 @@ import httpx
 
 from .config import DATA_DIR
 from .db import Store
-from .util import now_iso
+from .render import render_json, render_markdown, render_srt, render_text
+from .transcribe import TranscriptSegment
+from .util import atomic_write, file_lock, now_iso
 
 ROOT = Path(__file__).resolve().parent.parent
 # The source checkout's wrapper: loads MEDIA_ASR_REMOTE_ENV, remote full mode.
@@ -143,6 +146,55 @@ def episode_notes(notes: dict, row: sqlite3.Row) -> str:
     )
 
 
+def read_json(path: Path):
+    """Parse a JSON file and return it with the SHA-256 of the bytes read, so a
+    step can check before committing that its input has not changed."""
+    raw = path.read_bytes()
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
+
+
+def file_digest(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def write_named(
+    item_dir: Path,
+    *,
+    item_id: str,
+    title: str,
+    source: str,
+    duration: float | None,
+    language: str | None,
+    model: str,
+    segments: list[dict],
+) -> None:
+    """Write transcript_named.{md,srt,txt,json} for these segments."""
+    named = [
+        TranscriptSegment(
+            start=float(s["start"]), end=float(s["end"]), text=s["text"], speaker=s.get("speaker")
+        )
+        for s in segments
+    ]
+    meta = {
+        "title": title,
+        "source": source,
+        "duration": duration,
+        "language": language,
+        "model": model,
+    }
+    texts = {
+        "md": render_markdown(**meta, transcribed_at=now_iso(), segments=named),
+        "srt": render_srt(named),
+        "txt": render_text(named),
+        "json": render_json(item_id=item_id, **meta, segments=named),
+    }
+    for suffix, text in texts.items():
+        atomic_write(item_dir / f"transcript_named.{suffix}", text)
+
+
 def log(message: str) -> None:
     print(message, flush=True)
 
@@ -198,8 +250,18 @@ def update(
     The GPU host is ``gpu_env`` if it passes ``remote-check``, else
     ``fallback_gpu_env`` (else the wrapper's default env file). Every step is
     idempotent, so a failed run can be re-run as is. Returns 1 if any feed,
-    episode or step failed, after doing all the work it could.
+    episode or step failed, after doing all the work it could. One update per
+    library at a time: a second one exits 1 at once.
     """
+    lock = store.path.parent / ".library-update.lock"
+    with file_lock(lock, wait=False) as acquired:
+        if not acquired:
+            log(f"error: another library-update holds {lock}")
+            return 1
+        return _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, shell, sleep)
+
+
+def _update(store, shows, gpu_env, fallback_gpu_env, latest, workers, shell, sleep) -> int:
     if not REMOTE.exists():
         raise LibraryError(f"library-update needs the source checkout wrapper {REMOTE}")
     shell = shell or Shell()

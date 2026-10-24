@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -310,3 +311,50 @@ def test_apply_fixes_is_one_pass_longest_first() -> None:
     assert [s["text"] for s in segments] == ["OpenClaw Moment, OpenClaw", "no match"]
     assert {f["wrong"]: f["count"] for f in applied} == {"Open Cloud": 1, "Open Cloud Moment": 1}
     assert unused == [] and C.apply_fixes(segments, []) == ([], [])
+
+
+class LockedDB:
+    """A connection whose index writes fail, as when SQLite is locked."""
+
+    def __init__(self, conn) -> None:
+        self.conn = conn
+
+    def __getattr__(self, name: str):
+        return getattr(self.conn, name)
+
+    def __enter__(self):
+        return self.conn.__enter__()
+
+    def __exit__(self, *exc):
+        return self.conn.__exit__(*exc)
+
+    def executemany(self, *args):
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_failed_forced_correction_leaves_the_item_to_be_redone(tmp_path: Path) -> None:
+    store, items_dir, item = make_item(tmp_path, ["Skading Law."])
+    fixes = [("Skading Law", "Scaling Law")]
+    with llm.LLM("key", client=FixedClient(fixes)) as model:
+        assert C.run(store.conn, model, items_dir=items_dir) == 0
+        assert C.run(LockedDB(store.conn), model, force=True, items_dir=items_dir) == 1
+        assert not (items_dir / item / "terms.json").exists()
+        assert (items_dir / item / "enrich.json").exists()
+        assert C.run(store.conn, model, items_dir=items_dir) == 0
+    named = json.loads((items_dir / item / "transcript_named.json").read_text())["segments"]
+    assert [s["text"] for s in named] == [r["text"] for r in store.segments_for(item)]
+    assert named[0]["text"] == "Scaling Law."
+    store.close()
+
+
+def test_correction_refuses_a_named_base_that_changed(tmp_path: Path) -> None:
+    store, items_dir, item = make_item(tmp_path, ["Skading Law."])
+    row = store.get_item(item)
+    with llm.LLM("key", client=FixedClient([("Skading Law", "Scaling Law")])) as model:
+        result = C.correct_item(row, {}, {}, {}, model, items_dir)
+    base = items_dir / item / "named_base.json"
+    base.write_text(base.read_text().replace("Skading", "Skating"))
+    with pytest.raises(RuntimeError, match="enriched again"):
+        C.commit(store.conn, result, items_dir)
+    assert not (items_dir / item / "terms.json").exists()
+    store.close()

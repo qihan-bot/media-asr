@@ -7,6 +7,7 @@ import pytest
 
 from media_asr import library as L
 from media_asr.db import Segment, Store
+from media_asr.util import file_lock
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "docs/examples/podcast-library.toml"
 
@@ -229,3 +230,12 @@ def test_failed_items_listed_only_when_failed(store: Store, capsys) -> None:
     )
     assert L.update(store, SHOWS, shell=FakeShell(), sleep=lambda seconds: None) == 0
     assert "FAILED" not in capsys.readouterr().out
+
+
+def test_update_runs_once_per_library(store: Store, capsys) -> None:
+    shell = FakeShell()
+    with file_lock(store.path.parent / ".library-update.lock"):
+        assert L.update(store, SHOWS, shell=shell, sleep=lambda seconds: None) == 1
+    assert shell.calls == []
+    assert "another library-update holds" in capsys.readouterr().out
+    assert L.update(store, SHOWS, shell=shell, sleep=lambda seconds: None) == 0

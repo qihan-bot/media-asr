@@ -16,6 +16,9 @@ Writes ``transcript_named.{md,srt,txt,json}``, ``named_base.json`` (the input
 of ``correct-terms``) and ``enrich.json`` (the completion marker) next to the
 original transcript, which is left untouched, removes ``terms.json`` so the
 item is corrected again, and points the SQLite index at the named transcript.
+The writes happen under the item's lock, after checking that the transcript
+did not change meanwhile, and start by removing both markers, so a failure
+halfway leaves the item to be redone rather than marked done.
 """
 
 from __future__ import annotations
@@ -28,11 +31,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .config import ITEMS_DIR
-from .library import Show, episode_notes, host_hints, load_show_notes
+from .library import (
+    Show,
+    episode_notes,
+    file_digest,
+    host_hints,
+    load_show_notes,
+    read_json,
+    write_named,
+)
 from .llm import LLM
-from .render import render_all
-from .transcribe import TranscriptSegment
-from .util import atomic_write, now_iso
+from .util import atomic_write, item_lock, now_iso
 
 CHUNK_CHARS = {"zh": 2500, "en": 6000}
 
@@ -172,8 +181,7 @@ def enrich_item(
     workers: int,
     items_dir: Path,
 ) -> dict:
-    item_dir = items_dir / row["id"]
-    data = json.loads((item_dir / "transcript.json").read_text(encoding="utf-8"))
+    data, digest = read_json(items_dir / row["id"] / "transcript.json")
     segments = [s for s in data.get("segments", []) if str(s.get("text", "")).strip()]
     lang = "zh" if (row["language"] or data.get("language") or "").startswith("zh") else "en"
     texts, accepted = punctuate(llm, [s["text"] for s in segments], lang, workers)
@@ -215,29 +223,6 @@ def enrich_item(
             if seg.get("speaker") in names:
                 seg["speaker"] = names[seg["speaker"]]["name"]
 
-    named = [
-        TranscriptSegment(
-            start=float(s["start"]), end=float(s["end"]), text=s["text"], speaker=s.get("speaker")
-        )
-        for s in segments
-    ]
-    temp_dir = item_dir / "_named_tmp"
-    render_all(
-        out_dir=temp_dir,
-        item_id=row["id"],
-        title=row["title"],
-        source=data.get("source") or row["source"],
-        duration=data.get("duration") or row["duration"],
-        language=data.get("language") or row["language"],
-        model=(data.get("model") or "") + f" + {llm.model} punctuation/speaker names",
-        transcribed_at=now_iso(),
-        segments=named,
-    )
-    for suffix in ("md", "srt", "txt", "json"):
-        source = temp_dir / f"transcript.{suffix}"
-        atomic_write(item_dir / f"transcript_named.{suffix}", source.read_text(encoding="utf-8"))
-        source.unlink(missing_ok=True)
-    temp_dir.rmdir()
     report = {
         "enriched_at": now_iso(),
         "model": llm.model,
@@ -245,12 +230,39 @@ def enrich_item(
         "punctuated_segments": accepted,
         "speakers": names,
     }
-    return {"row": row, "segments": segments, "report": report}
+    render = {
+        "title": row["title"],
+        "source": data.get("source") or row["source"],
+        "duration": data.get("duration") or row["duration"],
+        "language": data.get("language") or row["language"],
+        "model": (data.get("model") or "") + f" + {llm.model} punctuation/speaker names",
+    }
+    return {"row": row, "segments": segments, "report": report, "render": render, "input": digest}
 
 
-def write_index(db: sqlite3.Connection, result: dict, items_dir: Path) -> None:
+def commit(db: sqlite3.Connection, result: dict, items_dir: Path, *, force: bool = False) -> bool:
+    """Write the item's named transcript, index, named_base.json and enrich.json.
+
+    Holds the item's lock throughout. Returns False without writing if another
+    run enriched the item meanwhile (unless ``force``); raises if the
+    transcript changed after it was read.
+    """
     row = result["row"]
     item_dir = items_dir / row["id"]
+    with item_lock(item_dir):
+        if not force and (item_dir / "enrich.json").exists():
+            return False
+        if file_digest(item_dir / "transcript.json") != result["input"]:
+            raise RuntimeError("transcript.json changed while enriching; the next run redoes it")
+        for marker in ("enrich.json", "terms.json"):
+            (item_dir / marker).unlink(missing_ok=True)
+        write_named(item_dir, item_id=row["id"], segments=result["segments"], **result["render"])
+        _write_index(db, result, item_dir)
+    return True
+
+
+def _write_index(db: sqlite3.Connection, result: dict, item_dir: Path) -> None:
+    row = result["row"]
     with db:
         db.execute("DELETE FROM segments WHERE item_id = ?", (row["id"],))
         db.executemany(
@@ -270,7 +282,6 @@ def write_index(db: sqlite3.Connection, result: dict, items_dir: Path) -> None:
         item_dir / "named_base.json",
         json.dumps(result["segments"], ensure_ascii=False) + "\n",
     )
-    (item_dir / "terms.json").unlink(missing_ok=True)
     # enrich.json is the completion marker, written after the index is updated.
     atomic_write(
         item_dir / "enrich.json", json.dumps(result["report"], ensure_ascii=False, indent=2) + "\n"
@@ -312,7 +323,12 @@ def run(
             row = futures[future]
             try:
                 result = future.result()
-                write_index(db, result, items_dir)
+                if not commit(db, result, items_dir, force=force):
+                    print(
+                        f"[{index}/{len(rows)}] skip {row['id']}: enriched by another run",
+                        flush=True,
+                    )
+                    continue
             except Exception as exc:  # noqa: BLE001 - report and continue
                 failed += 1
                 print(

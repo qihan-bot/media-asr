@@ -5,8 +5,15 @@ import os
 import re
 import subprocess
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows: no flock; locks below always succeed
+    fcntl = None
 
 
 def sanitize_proxy_env() -> None:
@@ -102,3 +109,27 @@ def atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+
+@contextmanager
+def file_lock(path: Path, *, wait: bool = True) -> Iterator[bool]:
+    """Hold an exclusive lock on ``path`` (created if missing) for the block.
+
+    Yields True. With ``wait=False`` it yields False at once if another holder
+    has the lock. A POSIX flock: separate opens exclude each other, even in one
+    process.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as handle:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+            except BlockingIOError:
+                yield False
+                return
+        yield True
+
+
+def item_lock(item_dir: Path):
+    """Lock one item's files (``<item>/.lock``) while a step reads and rewrites them."""
+    return file_lock(item_dir / ".lock")

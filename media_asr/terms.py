@@ -30,7 +30,9 @@ Needs the ``library`` extras (wordfreq, jieba, pypinyin).
 Input is ``named_base.json`` (punctuated, named, uncorrected; written by
 ``enrich``); output is ``transcript_named.*`` plus the search index.
 ``terms.json`` is the completion marker, and ``enrich`` removes it, so every
-re-enrichment is corrected again.
+re-enrichment is corrected again. The outputs are written under the item's
+lock, after checking that ``named_base.json`` did not change meanwhile, and
+``terms.json`` is removed before them, so a failure halfway is redone.
 """
 
 from __future__ import annotations
@@ -48,11 +50,9 @@ from pypinyin import Style, pinyin
 from wordfreq import zipf_frequency
 
 from .config import ITEMS_DIR
-from .library import episode_notes, load_show_notes
+from .library import episode_notes, file_digest, load_show_notes, read_json, write_named
 from .llm import LLM, TruncatedResponse
-from .render import render_all
-from .transcribe import TranscriptSegment
-from .util import atomic_write, now_iso
+from .util import atomic_write, item_lock, now_iso
 
 CHUNK_CHARS = {"zh": 6000, "en": 12000}
 # 3000 cut off the answer for chunks with many fixes; a chunk whose answer is
@@ -264,7 +264,7 @@ def find_fixes(llm: LLM, lines: list[str], prompt_for, label: str = "") -> list[
 def correct_item(row, notes, titles_by_feed, show_titles, llm: LLM, items_dir: Path) -> dict:
     item_dir = items_dir / row["id"]
     named = json.loads((item_dir / "transcript_named.json").read_text(encoding="utf-8"))
-    segments = json.loads((item_dir / "named_base.json").read_text(encoding="utf-8"))
+    segments, digest = read_json(item_dir / "named_base.json")
     lang = "zh" if (row["language"] or "").startswith("zh") else "en"
     speakers = sorted({s.get("speaker") for s in segments if s.get("speaker")})
     note_text = episode_notes(notes, row)
@@ -291,31 +291,6 @@ def correct_item(row, notes, titles_by_feed, show_titles, llm: LLM, items_dir: P
     accepted, rejected = select(fixes, full_text, reference, set(speakers))
     applied, unused = apply_fixes(segments, accepted)
 
-    temp_dir = item_dir / "_terms_tmp"
-    render_all(
-        out_dir=temp_dir,
-        item_id=row["id"],
-        title=named.get("title") or row["title"],
-        source=named.get("source") or row["source"],
-        duration=named.get("duration") or row["duration"],
-        language=named.get("language") or row["language"],
-        model=(named.get("model") or "").split(" + term")[0] + f" + term correction ({llm.model})",
-        transcribed_at=now_iso(),
-        segments=[
-            TranscriptSegment(
-                start=float(s["start"]),
-                end=float(s["end"]),
-                text=s["text"],
-                speaker=s.get("speaker"),
-            )
-            for s in segments
-        ],
-    )
-    for suffix in ("md", "srt", "txt", "json"):
-        source = temp_dir / f"transcript.{suffix}"
-        atomic_write(item_dir / f"transcript_named.{suffix}", source.read_text(encoding="utf-8"))
-        source.unlink(missing_ok=True)
-    temp_dir.rmdir()
     report = {
         "corrected_at": now_iso(),
         "model": llm.model,
@@ -323,10 +298,41 @@ def correct_item(row, notes, titles_by_feed, show_titles, llm: LLM, items_dir: P
         "rejected": rejected + unused,
         "replacements": sum(f["count"] for f in applied),
     }
-    return {"row": row, "segments": segments, "report": report}
+    render = {
+        "title": named.get("title") or row["title"],
+        "source": named.get("source") or row["source"],
+        "duration": named.get("duration") or row["duration"],
+        "language": named.get("language") or row["language"],
+        "model": (named.get("model") or "").split(" + term")[0]
+        + f" + term correction ({llm.model})",
+    }
+    return {"row": row, "segments": segments, "report": report, "render": render, "input": digest}
 
 
-def write_index(db: sqlite3.Connection, result: dict, items_dir: Path) -> None:
+def commit(db: sqlite3.Connection, result: dict, items_dir: Path, *, force: bool = False) -> bool:
+    """Write the item's corrected transcript, index and terms.json.
+
+    Holds the item's lock throughout. Returns False without writing if another
+    run corrected the item meanwhile (unless ``force``); raises if the item
+    was enriched again after named_base.json was read.
+    """
+    row = result["row"]
+    item_dir = items_dir / row["id"]
+    with item_lock(item_dir):
+        if not force and (item_dir / "terms.json").exists():
+            return False
+        if (
+            not (item_dir / "enrich.json").exists()
+            or file_digest(item_dir / "named_base.json") != result["input"]
+        ):
+            raise RuntimeError("enriched again during term correction; the next run redoes it")
+        (item_dir / "terms.json").unlink(missing_ok=True)
+        write_named(item_dir, item_id=row["id"], segments=result["segments"], **result["render"])
+        _write_index(db, result, item_dir)
+    return True
+
+
+def _write_index(db: sqlite3.Connection, result: dict, item_dir: Path) -> None:
     row = result["row"]
     with db:
         db.execute("DELETE FROM segments WHERE item_id = ?", (row["id"],))
@@ -338,8 +344,7 @@ def write_index(db: sqlite3.Connection, result: dict, items_dir: Path) -> None:
             ],
         )
     atomic_write(
-        items_dir / row["id"] / "terms.json",
-        json.dumps(result["report"], ensure_ascii=False, indent=2) + "\n",
+        item_dir / "terms.json", json.dumps(result["report"], ensure_ascii=False, indent=2) + "\n"
     )
 
 
@@ -378,7 +383,12 @@ def run(
             row = futures[future]
             try:
                 result = future.result()
-                write_index(db, result, items_dir)
+                if not commit(db, result, items_dir, force=force):
+                    print(
+                        f"[{index}/{len(rows)}] skip {row['id']}: corrected by another run",
+                        flush=True,
+                    )
+                    continue
             except Exception as exc:  # noqa: BLE001 - report and continue
                 failed += 1
                 print(
