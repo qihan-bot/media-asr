@@ -450,3 +450,165 @@ def test_a_mkdir_that_really_failed_is_still_an_error() -> None:
     remote._client, remote._sftp, remote._home = object(), Denied(clients=1), "/home/u"
     with pytest.raises(IOError, match="Permission denied"):
         remote._mkdirs("/home/u/work/jobs/x")
+
+
+def write_embed_job(root: Path, job_id: str) -> str:
+    job_dir = root / "jobs" / f"{job_id}.voiceprint"
+    job_dir.mkdir(parents=True)
+    job = {
+        "kind": "embed",
+        "id": job_id,
+        "source": f"https://a/{job_id}.mp3",
+        "source_type": "podcast",
+        "segments": [[0.0, 30.0], [30.0, 60.0]],
+        "fp": "fingerprint",
+        "job_dir": f"jobs/{job_id}.voiceprint",
+    }
+    (job_dir / "job.json").write_text(json.dumps(job))
+    return f"jobs/{job_id}.voiceprint/job.json"
+
+
+def test_an_embed_job_holds_the_gpu_lock_only_for_the_embeddings(
+    workdir: Path, monkeypatch
+) -> None:
+    import numpy as np
+
+    seen: list[tuple[str, bool]] = []
+    Phases(monkeypatch, lambda phase: seen.append((phase, lock_held(workdir / W.GPU_LOCK))))
+
+    def embed(wav_path, segments):
+        seen.append(("embed", lock_held(workdir / W.GPU_LOCK)))
+        return np.ones((2, 256), np.float32), np.array([0, 1]), np.array([16000, 16000])
+
+    monkeypatch.setattr(W, "embed_segments", embed)
+    assert W.main(["--job", write_embed_job(workdir, "ep1")]) == 0
+    assert seen == [("download", False), ("ffmpeg", False), ("embed", True)]
+    with np.load(workdir / "jobs/ep1.voiceprint/embeddings.npz") as z:
+        assert (
+            z["emb"].shape == (2, 256)
+            and list(z["seg"]) == [0, 1]
+            and str(z["fp"]) == "fingerprint"
+        )
+    assert not (workdir / "jobs/ep1.voiceprint/audio.wav").exists()
+
+
+def test_embed_segments_trims_and_caps_like_the_all_in_worker(tmp_path: Path, monkeypatch) -> None:
+    import contextlib
+    import wave
+
+    import numpy as np
+
+    class Tensor:
+        def __init__(self, array) -> None:
+            self.array = np.asarray(array)
+
+        def to(self, device):
+            return self
+
+        def __getitem__(self, index):
+            return Tensor(self.array[index])
+
+        def squeeze(self, axis):
+            return Tensor(self.array.squeeze(axis))
+
+        def float(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.array
+
+    class Model:
+        @classmethod
+        def from_pretrained(cls, name):
+            assert name == W.EMBEDDING_MODEL
+            return cls()
+
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+        def __call__(self, tensor):  # "embedding" = the number of samples it saw
+            return Tensor(np.full((1, 256), tensor.array.shape[-1], np.float32))
+
+    torch = fake_torch()
+    torch.cuda.is_available = lambda: False
+    torch.device = lambda name: name
+    torch.inference_mode = contextlib.nullcontext
+    torch.from_numpy = Tensor
+    pyannote = types.ModuleType("pyannote")
+    pyannote.audio = types.SimpleNamespace(Model=Model)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "pyannote", pyannote)
+    monkeypatch.setitem(sys.modules, "pyannote.audio", pyannote.audio)
+    wav = tmp_path / "audio.wav"
+    with wave.open(str(wav), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(np.zeros(16000 * 60, np.int16).tobytes())
+    segments = [[0.0, 1.0], [1.0, 3.0], [3.0, 40.0], [40.0, 41.5]]
+    emb, seg, samples = W.embed_segments(wav, segments)
+    # 0-1 s is 0.6 s after trimming: skipped; 3-40 s keeps its middle 20 s.
+    assert list(seg) == [1, 2, 3] and list(samples) == [25600, 320000, 17600]
+    assert emb.shape == (3, 256) and list(emb[:, 0]) == [25600, 320000, 17600]
+
+
+def test_run_embed_runs_its_own_job_and_returns_the_arrays(tmp_path: Path, monkeypatch) -> None:
+    import numpy as np
+
+    remote = RemoteGPU("gpu", shell="sh", workdir="work", python=".venv/bin/python")
+    remote._client, remote._sftp, remote._home = object(), FakeSFTP(), "/home/u"
+    job = "/home/u/work/jobs/ep_1.voiceprint"
+    commands: list[str] = []
+
+    def fake_exec(command, *, timeout, progress=None):
+        commands.append(command)
+        spec = json.loads(remote._sftp.files[f"{job}/job.json"])
+        assert (
+            spec["kind"] == "embed"
+            and spec["fp"] == "fp"
+            and spec["audio_url"] == "https://a/1.mp3"
+        )
+        assert spec["segments"] == [[0.0, 5.0], [5.0, 9.0]]
+        buffer = io.BytesIO()
+        np.savez(
+            buffer,
+            emb=np.ones((2, 256), np.float32),
+            seg=np.array([0, 1]),
+            samples=np.array([1, 2]),
+            fp=np.array("fp"),
+        )
+        remote._sftp.files[f"{job}/embeddings.npz"] = buffer.getvalue()
+        return ""
+
+    monkeypatch.setattr(remote, "_exec", fake_exec)
+    uploads: list[str] = []
+    real_put = remote._sftp.put
+    monkeypatch.setattr(
+        remote._sftp,
+        "put",
+        lambda local, path, callback=None: uploads.append(path) or real_put(local, path),
+    )
+    item = {
+        "id": "ep:1",
+        "source": "https://feed/1",
+        "source_type": "podcast",
+        "meta_json": json.dumps({"audio_url": "https://a/1.mp3"}),
+    }
+    segments = [{"start": 0.0, "end": 5.0}, {"start": 5.0, "end": 9.0}]
+    emb, seg, samples, fingerprint = remote.run_embed(item, segments, "fp")
+    assert emb.shape == (2, 256) and list(seg) == [0, 1] and fingerprint == "fp"
+    assert uploads == [f"{job}/remote_worker.py", f"{job}/media_asr.zip"]
+    assert commands == [
+        'cd "$HOME/work" && .venv/bin/python "jobs/ep_1.voiceprint/remote_worker.py" --job "jobs/ep_1.voiceprint/job.json"'
+    ]
+    assert not [path for path in remote._sftp.files if path.startswith(job)]  # cleaned up
+    local = tmp_path / "audio.mp3"
+    local.write_bytes(b"mp3")
+    with pytest.raises(Exception, match="downloadable source"):
+        remote.run_embed({"id": "x", "source": str(local)}, segments, "fp")

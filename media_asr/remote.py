@@ -502,6 +502,70 @@ class RemoteGPU:
             "meta": remote_meta,
         }
 
+    def run_embed(
+        self,
+        item: dict,
+        segments: list[dict],
+        fingerprint: str,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> tuple:
+        """Embed each segment of a diarized episode on the remote host (download
+        and ffmpeg there; the speaker-embedding model under the GPU lock).
+
+        Returns ``(emb, seg, samples, fingerprint)``, see
+        ``voiceprint.label_voices``. The job directory is ``jobs/<id>.voiceprint``,
+        apart from the episode's transcription job."""
+        import numpy as np
+
+        if Path(str(item["source"])).expanduser().is_file():
+            raise RemoteError("voiceprints need a downloadable source, not a local file")
+        self.connect()
+        log = progress or (lambda _: None)
+        item_id = str(item["id"])
+        job_rel = posixpath.join("jobs", re.sub(r"[^A-Za-z0-9_.-]+", "_", item_id) + ".voiceprint")
+        job_dir = self._path(job_rel)
+        try:
+            meta = json.loads(item.get("meta_json") or "{}")
+        except json.JSONDecodeError:
+            meta = {}
+        job = {
+            "kind": "embed",
+            "id": item_id,
+            "source": str(item["source"]),
+            "source_type": str(item.get("source_type") or "audio"),
+            "audio_url": meta.get("audio_url"),
+            "page_url": meta.get("page_url"),
+            "segments": [[float(s["start"]), float(s["end"])] for s in segments],
+            "fp": fingerprint,
+            "job_dir": job_rel,
+        }
+        local = Path(tempfile.mkdtemp(prefix="media-asr-voiceprint-")) / "embeddings.npz"
+        success = False
+        try:
+            self._mkdirs(job_dir)
+            with self._sftp.open(posixpath.join(job_dir, "job.json"), "w") as handle:
+                handle.write(json.dumps(job, ensure_ascii=False))
+            self._upload_script("remote_worker.py", job_rel)
+            self._upload_package(job_rel)
+            log(f"remote voiceprint on {self.host} ...")
+            self._exec(
+                self._cd_prefix()
+                + f'{self.python} "{job_rel}/remote_worker.py" --job "{job_rel}/job.json"',
+                timeout=self.timeout,
+                progress=log,
+            )
+            self._sftp.get(posixpath.join(job_dir, "embeddings.npz"), str(local))
+            with np.load(local) as z:
+                result = (z["emb"], z["seg"], z["samples"], str(z["fp"]))
+            success = True
+            return result
+        finally:
+            if not success or not self.keep_remote:
+                self._rmtree(job_dir)
+            local.unlink(missing_ok=True)
+            local.parent.rmdir()
+
     def _upload_script(
         self, name: str = "transcribe_openai_whisper.py", job_rel: str | None = None
     ) -> None:

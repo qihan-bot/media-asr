@@ -12,6 +12,10 @@ runs ``jobs/<id>/remote_worker.py`` from the work directory and downloads
 ``jobs/<id>/bundle.zip``.  Each job has its own copy of the code, so jobs can
 run side by side; they take turns on the GPU through ``gpu.lock`` in the work
 directory, held from loading Whisper to the end of diarization.
+
+A job with ``"kind": "embed"`` (``media-asr voiceprint``) instead embeds the
+given segments of the episode with the speaker-embedding model, under the same
+lock, and leaves ``jobs/<id>.voiceprint/embeddings.npz``.
 """
 
 from __future__ import annotations
@@ -30,6 +34,11 @@ from pathlib import Path
 
 # In the work directory: one job at a time loads models and runs on the GPU.
 GPU_LOCK = "gpu.lock"
+# Voiceprint jobs ("kind": "embed"): the speaker-embedding model of pyannote 3.1.
+EMBEDDING_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
+PAD = 0.2  # trim segment edges to avoid boundary bleed from neighbours
+MIN_LEN = 1.0  # seconds of audio after trimming
+MAX_LEN = 20.0  # embed at most the middle MAX_LEN seconds
 
 HALLUCINATION_PATTERNS = (
     r"字幕志愿者",
@@ -299,6 +308,82 @@ def run_pyannote(wav_path: Path, job: dict) -> list[tuple[float, float, int]]:
     ]
 
 
+def embed_segments(wav_path: Path, segments: list) -> tuple:
+    """WeSpeaker embedding of each ``[start, end]`` segment (edges trimmed by
+    PAD, at most the middle MAX_LEN seconds, skipped under MIN_LEN): the
+    embeddings [n, 256], their segment indices and the samples each covers."""
+    import numpy as np
+    import torch
+    from pyannote.audio import Model
+
+    with wave.open(str(wav_path), "rb") as handle:
+        if handle.getframerate() != 16000 or handle.getnchannels() != 1:
+            raise RuntimeError(f"expected 16 kHz mono audio: {wav_path}")
+        audio = (
+            np.frombuffer(handle.readframes(handle.getnframes()), dtype=np.int16).astype(np.float32)
+            / 32768.0
+        )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = Model.from_pretrained(EMBEDDING_MODEL)
+    model.to(device).eval()
+    embeddings, kept, samples = [], [], []
+    with torch.inference_mode():
+        for index, (start, end) in enumerate(segments):
+            start, end = float(start) + PAD, float(end) - PAD
+            if end - start < MIN_LEN:
+                continue
+            if end - start > MAX_LEN:
+                middle = (start + end) / 2
+                start, end = middle - MAX_LEN / 2, middle + MAX_LEN / 2
+            chunk = audio[int(start * 16000) : int(end * 16000)]
+            if len(chunk) < MIN_LEN * 16000:
+                continue
+            tensor = torch.from_numpy(chunk).to(device)[None, None, :]
+            embeddings.append(model(tensor).squeeze(0).float().cpu().numpy())
+            kept.append(index)
+            samples.append(len(chunk))
+    return (
+        np.stack(embeddings).astype(np.float32) if embeddings else np.zeros((0, 256), np.float32),
+        np.array(kept, dtype=np.int32),
+        np.array(samples, dtype=np.int64),
+    )
+
+
+def embed_job(job: dict, root: Path, job_dir: Path, download, normalize_audio) -> int:
+    """A voiceprint job: download and decode the episode beside other jobs, embed
+    its segments under the GPU lock, write ``embeddings.npz`` to the job directory."""
+    import numpy as np
+
+    print(f"worker: {job['id']} voiceprint, {len(job['segments'])} segments", flush=True)
+    item = {
+        "source": job["source"],
+        "source_type": job.get("source_type", "audio"),
+        "meta_json": json.dumps(
+            {"audio_url": job.get("audio_url"), "page_url": job.get("page_url")},
+            ensure_ascii=False,
+        ),
+    }
+    source_path, is_local = download(
+        item, job_dir, progress=lambda message: print(message, flush=True)
+    )
+    wav_path = job_dir / "audio.wav"
+    normalize_audio(source_path, wav_path)
+    if not is_local and source_path != wav_path:
+        source_path.unlink(missing_ok=True)
+    with gpu_lock(root / GPU_LOCK):
+        started = time.time()
+        emb, seg, samples = embed_segments(wav_path, job["segments"])
+        print(
+            f"worker: embedded {len(seg)}/{len(job['segments'])} segments "
+            f"in {time.time() - started:.1f}s",
+            flush=True,
+        )
+    np.savez(job_dir / "embeddings.npz", emb=emb, seg=seg, samples=samples, fp=np.array(job["fp"]))
+    wav_path.unlink(missing_ok=True)
+    print(f"DONE embeddings={len(seg)}", flush=True)
+    return 0
+
+
 def diarize(wav_path: Path, job: dict) -> tuple[list[tuple[float, float, int]], float]:
     """Speaker turns of the episode and the seconds it took."""
     print("worker: running speaker diarization", flush=True)
@@ -341,6 +426,8 @@ def main(argv: list[str] | None = None) -> int:
     from media_asr.transcribe import TranscriptSegment
     from media_asr.util import ffprobe_duration, now_iso
 
+    if job.get("kind") == "embed":
+        return embed_job(job, root, job_dir, download, normalize_audio)
     print(f"worker: {job['id']} source_type={job.get('source_type')}", flush=True)
     item = {
         "source": job["source"],
