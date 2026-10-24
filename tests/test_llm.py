@@ -74,3 +74,59 @@ def test_model_from_environment_and_direct_connection(monkeypatch) -> None:
     with L.LLM("key") as llm:
         assert llm.model == "deepseek-v4.1-flash-tp4"
         assert llm.client.trust_env is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.deepseek.com/chat/completions",
+        "http://8.8.8.8/v1/chat/completions",
+        "http://example.com/v1",
+        "http://169.254.1.1/v1",
+    ],
+)
+def test_cloud_or_public_endpoints_are_refused(monkeypatch, url: str) -> None:
+    monkeypatch.setenv("MEDIA_ASR_LLM_URL", url)
+    with pytest.raises(L.EndpointNotAllowed):
+        L.LLM("key", client=Client())
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://192.168.100.161:8889/v1/chat/completions",
+        "http://127.0.0.1:8000/v1",
+        "http://localhost:8000/v1",
+    ],
+)
+def test_lan_endpoints_are_allowed(monkeypatch, url: str) -> None:
+    monkeypatch.setenv("MEDIA_ASR_LLM_URL", url)
+    assert L.LLM("key", client=Client()).url == url
+
+
+def test_concurrency_is_capped_across_threads(monkeypatch) -> None:
+    import threading
+
+    monkeypatch.setattr(L, "_SLOTS", threading.BoundedSemaphore(2))
+    active, peak, lock = [0], [0], threading.Lock()
+
+    class Slow:
+        def post(self, *a, **k):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            threading.Event().wait(0.05)  # time.sleep is patched out in this module
+            with lock:
+                active[0] -= 1
+            return Response('{"ok": 1}', "stop")
+
+        def close(self):
+            pass
+
+    llm = L.LLM("key", client=Slow())
+    threads = [threading.Thread(target=llm.chat, args=("s", "u", 10)) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert peak[0] == 2

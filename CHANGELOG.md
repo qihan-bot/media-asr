@@ -6,9 +6,13 @@
   (`MEDIA_ASR_LLM_URL`, default `http://192.168.100.161:8889/v1/chat/completions`, model
   `deepseek-v4.1-flash-tp4`, key `MEDIA_ASR_LLM_KEY` or `LAN_MODEL_API_KEY`); the DeepSeek cloud API is no
   longer used by the library.
+- The endpoint must be loopback or a private-network address (checked before every request), so a
+  misconfigured `MEDIA_ASR_LLM_URL` cannot send transcripts or the LAN key to a cloud API.
+- At most `MEDIA_ASR_LLM_MAX_CONCURRENCY` requests in flight per process (default 4; the daily wrapper uses 3),
+  however callers nest their thread pools.
 - Five attempts per request (malformed JSON from the model recurs at roughly one episode in a hundred).
-- The daily wrapper injects `LAN_MODEL_API_KEY` and runs the LLM steps with `--workers 2`, since the DGX model
-  is shared with other agents.
+- The daily wrapper injects `LAN_MODEL_API_KEY` and runs the LLM steps with `--workers 2` and at most 3
+  requests in flight, since the DGX model is shared with other agents.
 
 ## 0.0.4 — 2026-10-24
 

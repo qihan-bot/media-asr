@@ -6,16 +6,43 @@ the LAN model, never the DeepSeek cloud API. ``MEDIA_ASR_LLM_URL`` / ``MEDIA_ASR
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import threading
 import time
+from urllib.parse import urlsplit
 
 import httpx
 
 DEFAULT_URL = "http://192.168.100.161:8889/v1/chat/completions"
 DEFAULT_MODEL = "deepseek-v4.1-flash-tp4"
 ATTEMPTS = 5
+# Requests in flight to the shared model from this process, however the callers nest their thread pools.
+_SLOTS = threading.BoundedSemaphore(
+    max(1, int(os.environ.get("MEDIA_ASR_LLM_MAX_CONCURRENCY", "4")))
+)
+
+
+class EndpointNotAllowed(ValueError):
+    """The configured endpoint is not on this machine or the LAN."""
+
+
+def check_endpoint(url: str) -> str:
+    """Accept only loopback or private-network endpoints (user rule: no cloud LLM for the library)."""
+    host = urlsplit(url).hostname or ""
+    if host == "localhost":
+        return url
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        raise EndpointNotAllowed(
+            f"LLM endpoint must be a LAN IP or localhost, not {host!r}"
+        ) from None
+    if not (address.is_private or address.is_loopback) or address.is_link_local:
+        raise EndpointNotAllowed(f"LLM endpoint must be a LAN IP or localhost, not {host!r}")
+    return url
 
 
 class TruncatedResponse(RuntimeError):
@@ -43,7 +70,7 @@ class LLM:
     def __init__(self, key: str, *, model: str | None = None, client: httpx.Client | None = None):
         self.key = key
         self.model = model or os.environ.get("MEDIA_ASR_LLM_MODEL") or DEFAULT_MODEL
-        self.url = os.environ.get("MEDIA_ASR_LLM_URL") or DEFAULT_URL
+        self.url = check_endpoint(os.environ.get("MEDIA_ASR_LLM_URL") or DEFAULT_URL)
         self.client = client or httpx.Client(trust_env=False)
 
     def __enter__(self) -> LLM:
@@ -74,12 +101,13 @@ class LLM:
                 time.sleep(3 * attempt)
             payload["temperature"] = 0 if attempt == 0 else 0.3
             try:
-                response = self.client.post(
-                    self.url,
-                    headers={"Authorization": f"Bearer {self.key}"},
-                    json=payload,
-                    timeout=300,
-                )
+                with _SLOTS:
+                    response = self.client.post(
+                        check_endpoint(self.url),
+                        headers={"Authorization": f"Bearer {self.key}"},
+                        json=payload,
+                        timeout=300,
+                    )
                 response.raise_for_status()
                 choice = response.json()["choices"][0]
                 return parse_json(choice["message"]["content"], choice.get("finish_reason"))
