@@ -13,7 +13,8 @@ library step for any show with reference voices.
 - `media-asr voiceprint` (run as `media-asr-remote voiceprint`; `library-update`
   runs it between rediarize and enrich when a show has voiceprints): the GPU
   host embeds each diarized segment with pyannote 3.1's speaker-embedding model,
-  under the GPU lock, in a job of its own (`"kind": "embed"`); each speaker
+  under the GPU lock, in a job of its own (`"kind": "embed"`, a fresh remote
+  directory per run, so two runs on one episode keep apart); each speaker
   label's mean voice is scored against the references with the rules of the
   All-In `voiceprint_relabel.py`, and `voiceprint.json` records per label match /
   no-match / insufficient with the closest reference, score, margin, seconds and
@@ -23,16 +24,22 @@ library step for any show with reference voices.
 - `enrich`: names matched by voice are kept (`"method": "voiceprint"`; host if
   the show's hosts list the name, else guest) and the model is asked only about
   the other labels, with the known ones listed; a model name that is a reference
-  voice the label does not sound like is rejected (`Speaker N`). Episodes
-  without `voiceprint.json` are named exactly as before.
+  voice the label does not sound like is rejected (`Speaker N`). Its commit
+  checks the `voiceprint.json` it used along with the transcript, so names made
+  before a voiceprint landed are not committed. Episodes without
+  `voiceprint.json` are named exactly as before.
 - `scripts/migrate_allin.py` moves the All-In archive (`data/`) into the
   library, keeping ids: diarized transcripts, database rows and segments, the
   feed, `voiceprint.json` computed from the archived embeddings, and the
   reference voices built from the archive. Dry run by default, `--apply`
-  idempotent; the archive is only read. On a copy of the live directories: 108
-  episodes, 19,029 segments, all 534 voice decisions as in the archive's final
-  speaker maps; with the archive's own model names replayed, 99.7% of the speaking
-  time gets the same speaker name (the rest is placeholder wording).
+  idempotent; the archive is only read, and overlapping archive and library
+  directories are refused. Each episode is checked again under its lock and a
+  database write lock before anything is written, so one the library got after
+  the survey is reported as a conflict, not overwritten. On a copy of the live
+  directories: 108 episodes, 19,029 segments, all 534 voice decisions as in the
+  archive's final speaker maps, 60.6% of the speaking time named by voice; with
+  the archive's own model names replayed, 99.7% of the speaking time gets the
+  same speaker name (the rest is placeholder wording).
 - Retired, as their work is now the library's: `scripts/podcast_daily.sh`,
   `diarize_existing.py`, `map_speakers.py`, `repair_speakers.py`,
   `voiceprint_relabel.py`, `embed_speakers.py`, `embed_speakers_worker.py`,
