@@ -11,7 +11,9 @@ One GPU host, kept busy: several remote jobs share it and take turns on its GPU.
   unavailable (Windows). Output files are unchanged.
 - Each remote job uploads and runs its own copy of the worker and the package
   in `jobs/<id>/`. They used to share the work directory root, so a starting
-  job could rewrite code another job was importing.
+  job could rewrite code another job was importing. Jobs that start together
+  on a fresh host may all create the shared `jobs/` directory; a `mkdir` that
+  fails because the directory now exists counts as success.
 - `library-update --jobs N` (default 1): the shows' pending and failed episodes
   are queued (oldest first, at most 100 per show, each once) and transcribed N
   at a time, each with its show's language in its own

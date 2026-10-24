@@ -573,7 +573,20 @@ class RemoteGPU:
             try:
                 self._sftp.stat(current)
             except IOError:
-                self._sftp.mkdir(current)
+                try:
+                    self._sftp.mkdir(current)
+                except IOError:
+                    # Jobs side by side create the shared jobs/ at once; SFTP
+                    # reports an existing path as a plain failure.
+                    if not self._is_dir(current):
+                        raise
+
+    def _is_dir(self, path: str) -> bool:
+        try:
+            mode = self._sftp.stat(path).st_mode
+        except IOError:
+            return False
+        return mode is None or stat.S_ISDIR(mode)
 
     def _cleanup(self, job_dir: str, names: list[str]) -> None:
         for name in names:

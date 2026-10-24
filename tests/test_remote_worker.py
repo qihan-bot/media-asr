@@ -272,8 +272,11 @@ class FakeSFTP:
         self.dirs: set[str] = set()
 
     def stat(self, path):
-        if path not in self.dirs and path not in self.files:
-            raise IOError(path)
+        if path in self.dirs:
+            return types.SimpleNamespace(st_mode=stat.S_IFDIR)
+        if path in self.files:
+            return types.SimpleNamespace(st_mode=stat.S_IFREG)
+        raise IOError(path)
 
     def mkdir(self, path):
         self.dirs.add(path)
@@ -374,3 +377,76 @@ def test_each_asr_job_runs_its_own_copy_under_the_gpu_lock(tmp_path: Path, monke
     )
     assert '--gpu-lock "gpu.lock"' in command
     assert not [path for path in remote._sftp.files if path.startswith(job)]  # cleaned up
+
+
+class RacingSFTP(FakeSFTP):
+    """One remote file system for several clients, as an SFTP server behaves:
+    mkdir of an existing path fails ("Failure"), and every client finds jobs/
+    missing before any of them creates it (a first run on a fresh host)."""
+
+    def __init__(self, clients: int) -> None:
+        super().__init__()
+        self.dirs = {"/home", "/home/u", "/home/u/work"}
+        self.guard = threading.Lock()
+        self.first_look = threading.Barrier(clients)
+
+    def stat(self, path):
+        with self.guard:
+            missing = path not in self.dirs and path not in self.files
+        if missing and path == "/home/u/work/jobs":
+            self.first_look.wait(5)
+            raise IOError(path)  # what this client saw, though another may create it now
+        return super().stat(path)
+
+    def mkdir(self, path):
+        with self.guard:
+            if path in self.dirs or path in self.files:
+                raise IOError("Failure")
+            self.dirs.add(path)
+
+
+def test_jobs_side_by_side_on_a_fresh_host_all_create_their_job_dirs(tmp_path: Path) -> None:
+    # Review 0.0.3 P2: three first runs at once; two failed creating jobs/.
+    sftp = RacingSFTP(clients=3)
+    results: dict[str, object] = {}
+
+    def run(n: int) -> None:
+        remote = RemoteGPU("gpu", shell="sh", workdir="work", python=".venv/bin/python")
+        remote._client, remote._sftp, remote._home = object(), sftp, "/home/u"
+
+        def fake_exec(command, *, timeout, progress=None):
+            bundle = io.BytesIO()
+            with zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr("transcript.json", json.dumps({"segments": []}))
+                archive.writestr("run.json", "{}")
+                archive.writestr("meta.json", "{}")
+            sftp.files[f"/home/u/work/jobs/ep{n}/bundle.zip"] = bundle.getvalue()
+            return ""
+
+        remote._exec = fake_exec
+        item = {"id": f"ep{n}", "source": f"https://a/{n}.mp3", "source_type": "podcast"}
+        out = tmp_path / f"ep{n}"
+        out.mkdir()
+        try:
+            results[f"ep{n}"] = remote.run_full(item, out)["segments"]
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+            results[f"ep{n}"] = exc
+
+    threads = [threading.Thread(target=run, args=(n,)) for n in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert results == {"ep0": [], "ep1": [], "ep2": []}
+    assert "/home/u/work/jobs" in sftp.dirs
+
+
+def test_a_mkdir_that_really_failed_is_still_an_error() -> None:
+    class Denied(RacingSFTP):
+        def mkdir(self, path):
+            raise IOError("Permission denied")
+
+    remote = RemoteGPU("gpu", shell="sh", workdir="work")
+    remote._client, remote._sftp, remote._home = object(), Denied(clients=1), "/home/u"
+    with pytest.raises(IOError, match="Permission denied"):
+        remote._mkdirs("/home/u/work/jobs/x")
