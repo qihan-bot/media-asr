@@ -22,6 +22,7 @@ def test_run_feed_contains_selects_only_matching_feed(tmp_path: Path, monkeypatc
         feed_url="https://feed.example/en-show/rss",
     )
     seen: list[str] = []
+    monkeypatch.setattr(cli, "ITEMS_DIR", tmp_path / "items")  # run locks items/<id>/.lock
     monkeypatch.setattr(
         cli, "_process_item", lambda store, item, *a, **k: seen.append(item["id"]) or True
     )
