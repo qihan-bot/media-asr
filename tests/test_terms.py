@@ -28,9 +28,12 @@ SPEAKERS = {"罗福莉", "张小珺", "泓君"}
         ("skew", "SKU", False),  # common English word
         ("Junark", "SF Compute", False),  # does not sound alike
         ("OE", "o1", False),  # short token, too loose
-        # pinyin: every character pair needs a toneless similarity >= 0.4
+        # pinyin: character pairs need a toneless similarity >= 0.4; three or
+        # more syllables tolerate one unlike pair, two syllables none
         ("余昊", "宇树", False),  # hao / shu 0.33
-        ("人物智能", "具身智能", False),  # ren / ju 0.0
+        ("人物智能", "具身智能", False),  # ren / ju and wu / shen: two unlike
+        ("巨星智能", "具身智能", True),  # xing / shen 0.25: the one tolerated
+        ("波斯文动力", "波士顿动力", True),  # wen / dun 0.33: the one tolerated
         ("巨声", "具身", True),  # sheng / shen 0.89
         ("冷量运输", "冷链运输", True),  # liang / lian 0.89
         ("付费一变不强", "付费意愿不强", True),  # bian / yuan 0.5
@@ -63,6 +66,12 @@ def test_pinyin_rule_uses_every_reading_and_only_chinese_pairs() -> None:
     assert not C.pinyin_mismatch("质朴", "智谱")
     assert not C.pinyin_mismatch("第3代", "第三代")  # the digit is not compared
     assert C.pinyin_mismatch("余昊", "宇树")
+
+
+def test_pinyin_rule_tolerates_one_unlike_syllable_in_three_or_more() -> None:
+    assert not C.pinyin_mismatch("达蒙院", "达摩院")  # meng / mo, 1 of 3
+    assert C.pinyin_mismatch("地基学习", "深度学习")  # di / shen, ji / du: 2 of 4
+    assert C.pinyin_mismatch("余昊3", "宇树3")  # 2 syllables: a digit does not count
 
 
 def test_select_tiers_and_filters() -> None:

@@ -8,15 +8,16 @@ replacements, recording every pair and its count in ``terms.json``.
 A pair is applied only if ``wrong`` occurs verbatim in the transcript, sounds
 like a mishearing of ``right``, and has a basis:
 
-* sound: a Chinese pair keeps its character (syllable) count and every
-  character pair sounds alike (toneless pinyin similarity of at least 0.4 for
-  some reading of each character, so "余昊" -> "宇树" is rejected and
-  "巨声" -> "具身" kept); an English pair keeps
-  a spelling similarity of at least 0.55 (0.65 for tokens of four characters
-  or fewer); and ``wrong`` is not a common word (wordfreq Zipf >= 3.5 zh /
-  3.0 en, so "福利" or "skew" is never replaced), unless ``right`` is a
-  speaker's name of the same length (a misheard self-introduction such as
-  "红军" -> "泓君"). Mixed Chinese/English pairs need high confidence.
+* sound: a Chinese pair keeps its character (syllable) count and its
+  characters sound alike: toneless pinyin similarity of at least 0.4 for some
+  reading of each character, with one exception allowed in three or more
+  syllables ("巨星智能" -> "具身智能" is kept, "余昊" -> "宇树" rejected); an
+  English pair keeps a spelling similarity of at least 0.55 (0.65 for tokens
+  of four characters or fewer); and ``wrong`` is not a common word (wordfreq
+  Zipf >= 3.5 zh / 3.0 en, so "福利" or "skew" is never replaced), unless
+  ``right`` is a speaker's name of the same length (a misheard
+  self-introduction such as "红军" -> "泓君"). Mixed Chinese/English pairs need
+  high confidence.
 * tier ``reference``: ``right`` appears in the episode's show notes, the show's
   episode titles, or the speaker names (high or medium confidence); or
 * tier ``model``: a widely known name or term the model rates high confidence.
@@ -116,13 +117,19 @@ def readings(char: str) -> frozenset[str]:
 
 
 def pinyin_mismatch(wrong: str, right: str) -> bool:
-    """True if a Chinese character pair of two same-length strings sounds unlike:
-    no reading of one is within 0.4 (difflib ratio) of a reading of the other."""
-    return any(
-        max(SequenceMatcher(None, a, b).ratio() for a in readings(w) for b in readings(r)) < 0.4
+    """True if two same-length Chinese strings do not sound alike.
+
+    A character pair is unlike when no reading of one is within 0.4 (difflib
+    ratio) of a reading of the other. Three or more syllables tolerate one
+    unlike pair (巨星智能 -> 具身智能: xing/shen); two tolerate none (余昊 -> 宇树).
+    """
+    scores = [
+        max(SequenceMatcher(None, a, b).ratio() for a in readings(w) for b in readings(r))
         for w, r in zip(wrong, right)
         if CJK.match(w) and CJK.match(r)
-    )
+    ]
+    unlike = sum(score < 0.4 for score in scores)
+    return unlike > (1 if len(scores) >= 3 else 0)
 
 
 def sound_problem(wrong: str, right: str, speakers: set[str], confidence) -> str | None:

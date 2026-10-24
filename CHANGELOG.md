@@ -18,10 +18,11 @@ Podcast library: the process scripts became package modules and subcommands.
 - One DeepSeek client (`media_asr/llm.py`) for all steps; the model comes from
   `MEDIA_ASR_LLM_MODEL` (was `MEDIA_ASR_ENRICH_MODEL`).
 - `correct-terms`: `max_tokens` 3000 → 8000, and an answer cut off at the limit
-  splits the chunk in two instead of failing the episode. Chinese pairs need a
-  toneless pinyin similarity of at least 0.4 for every character pair; English
-  pairs a spelling similarity of 0.55 (was 0.5). `named_base.json` (written by
-  `enrich`) is required.
+  splits the chunk in two instead of failing the episode. Chinese pairs must
+  sound alike: toneless pinyin similarity of at least 0.4 for every character
+  pair, one exception allowed in three or more syllables (巨星智能 → 具身智能
+  is kept, 余昊 → 宇树 rejected); English pairs need a spelling similarity of
+  0.55 (was 0.5). `named_base.json` (written by `enrich`) is required.
 - `run --feed-contains` limits a run to one feed, `run --ids` processes exactly
   the given items; the same title in the same feed is the same episode; direct
   downloads are retried 3 times.

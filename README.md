@@ -288,10 +288,10 @@ Audit and rollback:
   `Host N`, `Guest N` or `Speaker N` (`主持人N`, `嘉宾N`, `说话人N`).
 - In term correction the model never rewrites text. It proposes `wrong -> right`
   pairs, and a pair is applied as a literal replacement only if it sounds like a
-  mishearing (a Chinese pair keeps its length and every character pair is within
-  0.4 toneless pinyin similarity; an English pair keeps a spelling similarity of
-  0.55, 0.65 for short tokens; the wrong form is not a common word) and has a
-  basis: tier `reference` (the right form is in the show notes, episode titles or
+  mishearing (a Chinese pair keeps its length and its syllables are within 0.4
+  toneless pinyin similarity, one exception allowed in three or more syllables;
+  an English pair keeps a spelling similarity of 0.55, 0.65 for short tokens;
+  the wrong form is not a common word) and has a basis: tier `reference` (the right form is in the show notes, episode titles or
   speaker names) or tier `model` (a well-known term rated high confidence).
   `terms.json` lists every pair with its tier and count, and every rejected pair
   with the reason.
