@@ -6,14 +6,27 @@
 # one per line, after the marker line "READY:".
 set -euo pipefail
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-ENV_FILE="${MEDIA_ASR_REMOTE_ENV:-$HOME/.config/media-asr/remote.env}"
-set -a
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-set +a
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 export PYTHONPATH="$ROOT"
 cd "$ROOT"
+
+# GPU host, as library-update picks it: the 5900x if it passes remote-check,
+# else remote.env (the 5090 laptop). Setting MEDIA_ASR_REMOTE_ENV forces a host.
+if [[ -z "${MEDIA_ASR_REMOTE_ENV:-}" ]]; then
+  GPU_ENV="${MEDIA_ASR_GPU_ENV:-$HOME/.config/media-asr/remote-5900x.env}"
+  MEDIA_ASR_REMOTE_ENV="${MEDIA_ASR_FALLBACK_GPU_ENV:-$HOME/.config/media-asr/remote.env}"
+  if MEDIA_ASR_REMOTE_ENV="$GPU_ENV" timeout 90 ./media-asr-remote remote-check >/dev/null 2>&1; then
+    MEDIA_ASR_REMOTE_ENV="$GPU_ENV"
+  else
+    echo "gpu: $GPU_ENV failed remote-check"
+  fi
+fi
+export MEDIA_ASR_REMOTE_ENV  # media-asr-remote below loads it too
+echo "gpu: $MEDIA_ASR_REMOTE_ENV"
+set -a
+# shellcheck disable=SC1090
+. "$MEDIA_ASR_REMOTE_ENV"
+set +a
 
 echo "== refresh feed"
 # libsyn intermittently drops TLS connections (SSL EOF); retry before failing.
