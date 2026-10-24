@@ -124,6 +124,28 @@ media-asr-remote retranscribe <id> --label turbo-remote
 
 Remote temporary job directories are removed unless `--remote-keep`.
 
+## Several jobs on one host
+
+Jobs can run side by side on one GPU host (`media-asr library-update --jobs N`
+does). Each job uploads its own copy of the worker and the package to
+`jobs/<id>/` and runs it from there, so jobs never rewrite each other's code.
+They take turns on the GPU through an flock on `gpu.lock` in the work
+directory, held from loading Whisper to the end of pyannote diarization (the
+ASR-only mode holds it for loading and transcribing). Download, ffmpeg,
+sherpa-onnx diarization (CPU), rendering and bundling run outside it, so one
+job's downloads overlap another's GPU work. A job that has to wait logs
+`worker: waiting for the GPU` and then `worker: gpu_wait_seconds=...`.
+
+- The lock belongs to the work directory: give every client of a host the same
+  `MEDIA_ASR_REMOTE_WORKDIR`.
+- A job keeps its GPU memory until its worker exits, a few seconds after it
+  releases the lock (rendering and bundling); one Whisper large-v3-turbo plus
+  pyannote 3.1 job peaks at about 7.2 GiB, so a 12 GB card has room for that.
+- Without `fcntl` (Windows hosts) the lock is a no-op; run one job at a time
+  there.
+- `scripts/embed_speakers_worker.py` (All-In voiceprints) does not take the
+  lock: it runs one small speaker-embedding model.
+
 ## Diarization
 
 ### sherpa-onnx (offline)

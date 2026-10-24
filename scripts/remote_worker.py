@@ -5,10 +5,13 @@ Runs inside the remote GPU work directory.  The local CLI uploads:
 
     jobs/<id>/job.json
     jobs/<id>/source.<ext>      (only for local files)
-    media_asr.zip
-    remote_worker.py
+    jobs/<id>/media_asr.zip
+    jobs/<id>/remote_worker.py
 
-and downloads ``jobs/<id>/bundle.zip``.
+runs ``jobs/<id>/remote_worker.py`` from the work directory and downloads
+``jobs/<id>/bundle.zip``.  Each job has its own copy of the code, so jobs can
+run side by side; they take turns on the GPU through ``gpu.lock`` in the work
+directory, held from loading Whisper to the end of diarization.
 """
 
 from __future__ import annotations
@@ -21,7 +24,12 @@ import sys
 import time
 import wave
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+
+# In the work directory: one job at a time loads models and runs on the GPU.
+GPU_LOCK = "gpu.lock"
 
 HALLUCINATION_PATTERNS = (
     r"字幕志愿者",
@@ -36,6 +44,29 @@ HALLUCINATION_PATTERNS = (
     r"\bamara\.org\b",
     r"thanks for watching",
 )
+
+
+@contextmanager
+def gpu_lock(path: Path) -> Iterator[None]:
+    """Hold the host's GPU lock for the block, waiting while another job has it.
+
+    An flock, so the kernel releases it if the worker dies. A no-op where
+    fcntl is unavailable (Windows).
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    with open(path, "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"worker: waiting for the GPU ({path.name} is held by another job)", flush=True)
+            started = time.time()
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            print(f"worker: gpu_wait_seconds={time.time() - started:.1f}", flush=True)
+        yield
 
 
 def is_hallucination(text: str) -> bool:
@@ -268,12 +299,24 @@ def run_pyannote(wav_path: Path, job: dict) -> list[tuple[float, float, int]]:
     ]
 
 
-def main() -> int:
+def diarize(wav_path: Path, job: dict) -> tuple[list[tuple[float, float, int]], float]:
+    """Speaker turns of the episode and the seconds it took."""
+    print("worker: running speaker diarization", flush=True)
+    started = time.time()
+    if job.get("diarization_backend", "sherpa") == "pyannote":
+        turns = run_pyannote(wav_path, job)
+    else:
+        turns = run_diarization(wav_path, job)
+    return turns, round(time.time() - started, 1)
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--job", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     root = Path.cwd()
+    here = Path(__file__).resolve().parent  # the job's own copy of the code
     job = json.loads(Path(args.job).read_text(encoding="utf-8"))
     token_file = job.get("hf_token_file")
     if token_file:
@@ -287,11 +330,11 @@ def main() -> int:
 
     # Make ffmpeg/ffprobe and the uploaded package available.
     os.environ["PATH"] = str(root) + os.pathsep + os.environ.get("PATH", "")
-    sys.path.insert(0, str(root))
-    package = root / "media_asr.zip"
+    sys.path.insert(0, str(here))
+    package = here / "media_asr.zip"
     if package.exists():
         with zipfile.ZipFile(package) as archive:
-            archive.extractall(root)
+            archive.extractall(here)
 
     from media_asr.fetch import download, normalize_audio
     from media_asr.render import render_all
@@ -325,47 +368,47 @@ def main() -> int:
     import whisper
 
     model_name = job.get("model", "large-v3-turbo")
-    print(
-        f"worker: torch={torch.__version__} cuda={torch.cuda.is_available()} "
-        f"gpu={torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-'}",
-        flush=True,
-    )
-    started = time.time()
-    model = whisper.load_model(
-        model_name,
-        device="cuda",
-        download_root=job.get("download_root", "models"),
-    )
-    print(f"worker: model_loaded_seconds={time.time() - started:.1f}", flush=True)
+    diarization_elapsed = None
+    turns: list[tuple[float, float, int]] = []
+    pyannote = bool(job.get("diarize")) and job.get("diarization_backend") == "pyannote"
+    # Download and ffmpeg above, rendering and bundling below run beside other
+    # jobs; loading and running the models waits for the GPU.
+    with gpu_lock(root / GPU_LOCK):
+        print(
+            f"worker: torch={torch.__version__} cuda={torch.cuda.is_available()} "
+            f"gpu={torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-'}",
+            flush=True,
+        )
+        started = time.time()
+        model = whisper.load_model(
+            model_name,
+            device="cuda",
+            download_root=job.get("download_root", "models"),
+        )
+        print(f"worker: model_loaded_seconds={time.time() - started:.1f}", flush=True)
 
-    started = time.time()
-    transcribe_kwargs = dict(
-        language=job.get("language") or None,
-        initial_prompt=job.get("prompt") or None,
-        fp16=torch.cuda.is_available(),
-        verbose=False,
-        beam_size=int(job.get("beam", 5)),
-        word_timestamps=bool(job.get("diarize")),
-        condition_on_previous_text=bool(job.get("condition_on_previous_text", False)),
-    )
-    if job.get("temperature") is not None:
-        transcribe_kwargs["temperature"] = float(job["temperature"])
-    result = model.transcribe(str(wav_path), **transcribe_kwargs)
-    elapsed = time.time() - started
+        started = time.time()
+        transcribe_kwargs = dict(
+            language=job.get("language") or None,
+            initial_prompt=job.get("prompt") or None,
+            fp16=torch.cuda.is_available(),
+            verbose=False,
+            beam_size=int(job.get("beam", 5)),
+            word_timestamps=bool(job.get("diarize")),
+            condition_on_previous_text=bool(job.get("condition_on_previous_text", False)),
+        )
+        if job.get("temperature") is not None:
+            transcribe_kwargs["temperature"] = float(job["temperature"])
+        result = model.transcribe(str(wav_path), **transcribe_kwargs)
+        elapsed = time.time() - started
+        if pyannote:
+            turns, diarization_elapsed = diarize(wav_path, job)
+    if job.get("diarize") and not pyannote:  # sherpa-onnx runs on the CPU
+        turns, diarization_elapsed = diarize(wav_path, job)
 
     raw_segments = result.get("segments", [])
     speakers: list[str] = []
-    diarization_elapsed = None
-    turns: list[tuple[float, float, int]] = []
     if job.get("diarize"):
-        print("worker: running speaker diarization", flush=True)
-        diarization_started = time.time()
-        backend = job.get("diarization_backend", "sherpa")
-        if backend == "pyannote":
-            turns = run_pyannote(wav_path, job)
-        else:
-            turns = run_diarization(wav_path, job)
-        diarization_elapsed = round(time.time() - diarization_started, 1)
         segments = build_speaker_segments(
             raw_segments, turns, simplify=not bool(job.get("traditional"))
         )

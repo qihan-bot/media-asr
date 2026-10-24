@@ -21,6 +21,8 @@ import argparse
 import json
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 HALLUCINATION_PATTERNS = (
@@ -36,6 +38,29 @@ HALLUCINATION_PATTERNS = (
     r"\bamara\.org\b",
     r"thanks for watching",
 )
+
+
+@contextmanager
+def gpu_lock(path: str | None) -> Iterator[None]:
+    """Hold an flock on ``path`` for the block, waiting while another job has it
+    (one GPU job at a time per host, like remote_worker.py). A no-op without a
+    path or where fcntl is unavailable (Windows)."""
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if not path or fcntl is None:
+        yield
+        return
+    with open(path, "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"waiting for the GPU ({path} is held by another job)", flush=True)
+            started = time.time()
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            print(f"gpu_wait_seconds={time.time() - started:.1f}", flush=True)
+        yield
 
 
 def is_hallucination(text: str) -> bool:
@@ -59,7 +84,7 @@ def simplify(text: str) -> str:
     return zhconv.convert(text, "zh-cn")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", required=True)
     parser.add_argument("--model", default="large-v3-turbo")
@@ -86,7 +111,12 @@ def main() -> int:
         action="store_true",
         help="do not convert Chinese output to Simplified",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--gpu-lock",
+        default=None,
+        help="hold an flock on this file while loading and running the model",
+    )
+    args = parser.parse_args(argv)
     if args.prompt_file:
         args.prompt = Path(args.prompt_file).read_text(encoding="utf-8").strip()
 
@@ -94,38 +124,39 @@ def main() -> int:
     import whisper
 
     device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        raise SystemExit("CUDA is not available")
-    print(
-        f"torch {torch.__version__} device={device} "
-        f"gpu={torch.cuda.get_device_name(0) if device == 'cuda' else '-'}",
-        flush=True,
-    )
+    with gpu_lock(args.gpu_lock):
+        if device == "cuda" and not torch.cuda.is_available():
+            raise SystemExit("CUDA is not available")
+        print(
+            f"torch {torch.__version__} device={device} "
+            f"gpu={torch.cuda.get_device_name(0) if device == 'cuda' else '-'}",
+            flush=True,
+        )
 
-    started = time.time()
-    model = whisper.load_model(
-        args.model,
-        device=device,
-        download_root=args.download_root,
-    )
-    print(f"model_loaded_seconds={time.time() - started:.1f}", flush=True)
+        started = time.time()
+        model = whisper.load_model(
+            args.model,
+            device=device,
+            download_root=args.download_root,
+        )
+        print(f"model_loaded_seconds={time.time() - started:.1f}", flush=True)
 
-    started = time.time()
-    transcribe_kwargs = dict(
-        language=args.language or None,
-        initial_prompt=args.prompt,
-        fp16=device == "cuda",
-        verbose=False,
-        beam_size=args.beam,
-        condition_on_previous_text=args.condition_on_previous_text,
-    )
-    if args.temperature is not None:
-        transcribe_kwargs["temperature"] = args.temperature
-    result = model.transcribe(
-        str(Path(args.audio).expanduser().resolve()),
-        **transcribe_kwargs,
-    )
-    elapsed = time.time() - started
+        started = time.time()
+        transcribe_kwargs = dict(
+            language=args.language or None,
+            initial_prompt=args.prompt,
+            fp16=device == "cuda",
+            verbose=False,
+            beam_size=args.beam,
+            condition_on_previous_text=args.condition_on_previous_text,
+        )
+        if args.temperature is not None:
+            transcribe_kwargs["temperature"] = args.temperature
+        result = model.transcribe(
+            str(Path(args.audio).expanduser().resolve()),
+            **transcribe_kwargs,
+        )
+        elapsed = time.time() - started
 
     segments = []
     dropped = 0

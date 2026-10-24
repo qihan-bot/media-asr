@@ -14,6 +14,9 @@ from typing import Callable
 
 from .transcribe import TranscriptResult, TranscriptSegment
 
+# The remote workers' GPU lock, in the work directory (scripts/remote_worker.py).
+GPU_LOCK = "gpu.lock"
+
 
 class RemoteError(RuntimeError):
     pass
@@ -284,16 +287,17 @@ class RemoteGPU:
             )
             with self._sftp.open(posixpath.join(self._base(), remote_prompt), "w") as handle:
                 handle.write(prompt or "")
-            self._upload_script()
+            self._upload_script(job_rel=job_rel)
 
             command = (
                 self._cd_prefix()
-                + f'{self.python} transcribe_openai_whisper.py '
+                + f'{self.python} "{job_rel}/transcribe_openai_whisper.py" '
                 f'--audio "{remote_audio}" --output "{remote_output}" '
                 f'--model "{model}" --language "{language}" '
                 f'--download-root "{self.model_dir}" '
                 f'--beam {int(beam)} '
-                f'--prompt-file "{remote_prompt}"'
+                f'--prompt-file "{remote_prompt}" '
+                f'--gpu-lock "{GPU_LOCK}"'
                 + (
                     " --condition-on-previous-text"
                     if self.condition_on_previous_text
@@ -311,7 +315,13 @@ class RemoteGPU:
             if not success or not self.keep_remote:
                 self._cleanup(
                     job_dir,
-                    ["audio.wav", "prompt.txt", "result.json", "remote_result.json"],
+                    [
+                        "audio.wav",
+                        "prompt.txt",
+                        "result.json",
+                        "remote_result.json",
+                        "transcribe_openai_whisper.py",
+                    ],
                 )
             else:
                 log(f"remote job kept at {job_dir}")
@@ -419,9 +429,10 @@ class RemoteGPU:
             "temperature": None,
             "job_dir": job_rel,
         }
+        # Each job runs its own copy of the code, so jobs can run side by side.
         command = (
             self._cd_prefix()
-            + f'{self.python} remote_worker.py --job "{job_rel}/job.json"'
+            + f'{self.python} "{job_rel}/remote_worker.py" --job "{job_rel}/job.json"'
         )
         local_bundle = item_dir / "bundle.zip"
         token_rel = None
@@ -436,8 +447,8 @@ class RemoteGPU:
             with self._sftp.open(job_path, "w") as handle:
                 handle.write(json.dumps(job, ensure_ascii=False, indent=2))
 
-            self._upload_script("remote_worker.py")
-            self._upload_package()
+            self._upload_script("remote_worker.py", job_rel)
+            self._upload_package(job_rel)
 
             log(f"remote full pipeline on {self.host} ...")
             self._exec(command, timeout=self.timeout, progress=log)
@@ -491,7 +502,10 @@ class RemoteGPU:
             "meta": remote_meta,
         }
 
-    def _upload_script(self, name: str = "transcribe_openai_whisper.py") -> None:
+    def _upload_script(
+        self, name: str = "transcribe_openai_whisper.py", job_rel: str | None = None
+    ) -> None:
+        """Upload a helper script to the work directory, or to the job's directory."""
         package_root = Path(__file__).resolve().parent
         candidates = [
             package_root.parent / "scripts" / name,
@@ -500,9 +514,10 @@ class RemoteGPU:
         script = next((path for path in candidates if path.exists()), None)
         if script is None:
             raise RemoteError(f"missing remote helper script: {name}")
-        self._upload(script, self._path(name), progress=None)
+        self._upload(script, self._path(*filter(None, [job_rel, name])), progress=None)
 
-    def _upload_package(self) -> None:
+    def _upload_package(self, job_rel: str | None = None) -> None:
+        """Upload media_asr.zip to the work directory, or to the job's directory."""
         package_root = Path(__file__).resolve().parent
         handle = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
         handle.close()
@@ -511,7 +526,9 @@ class RemoteGPU:
             with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
                 for path in sorted(package_root.glob("*.py")):
                     archive.write(path, f"media_asr/{path.name}")
-            self._upload(archive_path, self._path("media_asr.zip"), progress=None)
+            self._upload(
+                archive_path, self._path(*filter(None, [job_rel, "media_asr.zip"])), progress=None
+            )
         finally:
             archive_path.unlink(missing_ok=True)
 
