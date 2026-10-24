@@ -221,3 +221,44 @@ def test_a_new_transcript_makes_later_steps_run_again(tmp_path: Path, monkeypatc
     assert [r["text"] for r in store.segments_for(item)] == [s["text"] for s in named]
     assert not (items_dir / item / "terms.json").exists()  # correct-terms runs again
     store.close()
+
+
+def test_one_bad_episode_does_not_stop_the_others(tmp_path: Path, capsys) -> None:
+    store = Store(tmp_path / "media.db")
+    items_dir = tmp_path / "items"
+    ids = []
+    for n in range(5):
+        item, _ = store.add_item(source=f"https://a/{n}.mp3", source_type="podcast", title=f"ep{n}")
+        store.save_result(
+            item,
+            segments=[Segment(0, 1, "a")],
+            duration=100.0,
+            language="en",
+            model="m",
+            transcript_path="t.md",
+        )
+        (items_dir / item).mkdir(parents=True)
+        (items_dir / item / "transcript.json").write_text(json.dumps({"segments": segments(0.95)}))
+        ids.append(item)
+    (items_dir / ids[2] / "transcript.json").write_text("{not json")
+    answers = {
+        "ep0": {"merged": False, "people": "two", "reason": "x"},  # the review's case
+        "ep1": {"merged": "false", "people": 1},  # a string, not a boolean
+        "ep3": {"merged": True, "people": 3, "reason": "panel"},  # the re-run raises
+        "ep4": {"merged": False, "people": 1, "reason": "monologue"},
+    }
+
+    class LLM:
+        def chat(self, system: str, prompt: str, max_tokens: int) -> dict:
+            return answers[prompt.split("Episode title: ")[1].split("\n")[0]]
+
+    def rerun(item_id: str, language: str, num_speakers: int):
+        raise FileNotFoundError("media-asr-remote")
+
+    assert R.run(store.conn, LLM(), items_dir=items_dir, rerun=rerun) == 1
+    marked = [n for n, item in enumerate(ids) if (items_dir / item / "rediarize.json").exists()]
+    assert marked == [4]
+    out = capsys.readouterr().out
+    assert out.count("FAIL") == 4
+    assert "people is not a number: 'two'" in out and "malformed verdict" in out
+    store.close()

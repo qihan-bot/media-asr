@@ -102,6 +102,79 @@ def rerun_remote(item_id: str, language: str, num_speakers: int) -> subprocess.C
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
 
 
+def parse_verdict(verdict) -> tuple[bool, int]:
+    """(merged, people) from the model's answer; ValueError if it is malformed."""
+    if not isinstance(verdict, dict) or not isinstance(verdict.get("merged"), bool):
+        raise ValueError(f"malformed verdict: {json.dumps(verdict, ensure_ascii=False)[:200]}")
+    try:
+        return verdict["merged"], int(verdict.get("people") or 0)
+    except (TypeError, ValueError):
+        raise ValueError(f"people is not a number: {verdict.get('people')!r}") from None
+
+
+def check(row, llm: LLM, *, share: float, dry_run: bool, items_dir: Path, rerun) -> bool:
+    """Check one episode and redo it if needed; False if the check or re-run failed."""
+    item_dir = items_dir / row["id"]
+    marker = item_dir / "rediarize.json"
+    transcript = item_dir / "transcript.json"
+    if marker.exists() or not transcript.exists():
+        return True
+    data, digest = read_json(transcript)
+    segments = [s for s in data["segments"] if str(s.get("text", "")).strip()]
+    shares = label_shares(segments)
+    if not segments or shares.most_common(1)[0][1] <= share:
+        return True
+    label, prompt = build_prompt(row["title"], segments, shares)
+    try:
+        verdict = llm.chat(
+            "You audit speaker diarization. Output valid JSON only.",
+            prompt,
+            400,
+        )
+        merged, people = parse_verdict(verdict)
+    except Exception as exc:  # noqa: BLE001 - leave unmarked, retried next run
+        print(f"FAIL check {row['id']}: {exc}", flush=True)
+        return False
+    before = round(shares[label], 3)
+    print(
+        f"{'MERGED' if merged else 'ok    '} {before:.0%} people={people} {row['title'][:50]} "
+        f"| {str(verdict.get('reason', ''))[:100]}",
+        flush=True,
+    )
+    if dry_run:
+        return True
+    record = {"checked_at": now_iso(), "label": label, "share_before": before, **verdict}
+    # Library run 2026-10-23: re-diarizing every flagged episode moved the largest
+    # label by <3 points in 81 of 86 cases (a guest holding ~80% of a long
+    # interview is normal); it only helped hard merges and 3+ people.
+    if merged and people >= 2 and (before > 0.9 or people >= 3):
+        # Not under the item's lock: `run` takes it, and drops the later
+        # steps' markers before it writes the new transcript.
+        lang = "zh" if (row["language"] or "").startswith("zh") else "en"
+        result = rerun(row["id"], lang, people + 1)
+        if result.returncode != 0:
+            print(
+                f"FAIL rerun {row['id']}: {result.stdout[-300:]} {result.stderr[-300:]}",
+                flush=True,
+            )
+            return False
+        with item_lock(item_dir):
+            after = label_shares(read_json(transcript)[0]["segments"]).most_common(1)[0][1]
+            record["share_after"] = round(after, 3)
+            (item_dir / "enrich.json").unlink(missing_ok=True)
+            atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+        print(f"       rerun: largest label {before:.0%} -> {after:.0%}", flush=True)
+        return True
+    with item_lock(item_dir):
+        if marker.exists():
+            return True  # checked by another run meanwhile
+        if file_digest(transcript) != digest:
+            print(f"FAIL check {row['id']}: transcript.json changed meanwhile", flush=True)
+            return False
+        atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+    return True
+
+
 def run(
     db: sqlite3.Connection,
     llm: LLM,
@@ -112,71 +185,19 @@ def run(
     items_dir: Path = ITEMS_DIR,
     rerun=rerun_remote,
 ) -> int:
-    """Check and redo merged episodes; return 1 if a check or re-run failed."""
+    """Check and redo merged episodes; return 1 if any episode failed.
+
+    A failure (bad transcript, malformed verdict, failed re-run) affects only
+    its episode, which stays unmarked and is checked again on the next run.
+    """
     index, shards = (int(x) for x in shard.split("/"))
     rows = db.execute("SELECT * FROM items WHERE status = 'done' ORDER BY published_at").fetchall()
     failed = 0
     for row in rows[index::shards]:
-        item_dir = items_dir / row["id"]
-        marker = item_dir / "rediarize.json"
-        transcript = item_dir / "transcript.json"
-        if marker.exists() or not transcript.exists():
-            continue
-        data, digest = read_json(transcript)
-        segments = [s for s in data["segments"] if str(s.get("text", "")).strip()]
-        shares = label_shares(segments)
-        if not segments or shares.most_common(1)[0][1] <= share:
-            continue
-        label, prompt = build_prompt(row["title"], segments, shares)
         try:
-            verdict = llm.chat(
-                "You audit speaker diarization. Output valid JSON only.",
-                prompt,
-                400,
-            )
-        except Exception as exc:  # noqa: BLE001 - leave unmarked, retried next run
-            failed += 1
-            print(f"FAIL check {row['id']}: {exc}", flush=True)
-            continue
-        merged = bool(verdict.get("merged"))
-        people = int(verdict.get("people") or 0)
-        before = round(shares[label], 3)
-        print(
-            f"{'MERGED' if merged else 'ok    '} {before:.0%} people={people} {row['title'][:50]} "
-            f"| {verdict.get('reason', '')[:100]}",
-            flush=True,
-        )
-        if dry_run:
-            continue
-        record = {"checked_at": now_iso(), "label": label, "share_before": before, **verdict}
-        # Library run 2026-10-23: re-diarizing every flagged episode moved the largest
-        # label by <3 points in 81 of 86 cases (a guest holding ~80% of a long
-        # interview is normal); it only helped hard merges and 3+ people.
-        if merged and people >= 2 and (before > 0.9 or people >= 3):
-            # Not under the item's lock: `run` takes it, and drops the later
-            # steps' markers before it writes the new transcript.
-            lang = "zh" if (row["language"] or "").startswith("zh") else "en"
-            result = rerun(row["id"], lang, people + 1)
-            if result.returncode != 0:
-                failed += 1
-                print(
-                    f"FAIL rerun {row['id']}: {result.stdout[-300:]} {result.stderr[-300:]}",
-                    flush=True,
-                )
-                continue
-            with item_lock(item_dir):
-                after = label_shares(read_json(transcript)[0]["segments"]).most_common(1)[0][1]
-                record["share_after"] = round(after, 3)
-                (item_dir / "enrich.json").unlink(missing_ok=True)
-                atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
-            print(f"       rerun: largest label {before:.0%} -> {after:.0%}", flush=True)
-            continue
-        with item_lock(item_dir):
-            if marker.exists():
-                continue  # checked by another run meanwhile
-            if file_digest(transcript) != digest:
-                failed += 1
-                print(f"FAIL check {row['id']}: transcript.json changed meanwhile", flush=True)
-                continue
-            atomic_write(marker, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+            ok = check(row, llm, share=share, dry_run=dry_run, items_dir=items_dir, rerun=rerun)
+        except Exception as exc:  # noqa: BLE001 - this episode only; retried next run
+            ok = False
+            print(f"FAIL {row['id']}: {exc}", flush=True)
+        failed += not ok
     return 1 if failed else 0
