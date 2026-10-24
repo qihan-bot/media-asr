@@ -470,3 +470,27 @@ def test_checks_run_in_parallel_and_reruns_one_at_a_time(tmp_path: Path, capsys)
         store.close()
     assert peaks == [{"check": 1, "rerun": 1}, {"check": 4, "rerun": 1}]
     assert outputs[0] == outputs[1]  # verdicts are reported and acted on in order
+
+
+def test_reruns_use_the_remote_worker_and_its_gpu_lock(tmp_path: Path, monkeypatch) -> None:
+    # The full remote pipeline runs remote_worker.py, which holds gpu.lock for
+    # the GPU phase; a re-run must not bypass it (e.g. through ASR-only mode).
+    store, items_dir, item = one_episode(tmp_path)
+    monkeypatch.setattr(cli, "ITEMS_DIR", items_dir)
+    seen = {}
+
+    def from_args(args):
+        seen.update(vars(args))
+        return FakeRemote(fail=False)
+
+    monkeypatch.setattr(cli.RemoteGPU, "from_args", from_args)
+    # FakeRemote has only run_full: the ASR-only path would raise here.
+    digest = cli._rerun_item(store, item, "zh", 3)
+    assert digest == file_digest(items_dir / item / "transcript.json")
+    assert (seen["remote_mode"], seen["diarize"], seen["diarization_backend"]) == (
+        "full",
+        True,
+        "pyannote",
+    )
+    assert (seen["language"], seen["num_speakers"]) == ("zh", 3)
+    store.close()
