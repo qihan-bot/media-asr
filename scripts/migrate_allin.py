@@ -24,9 +24,12 @@ as ``voiceprint_relabel.py`` built its templates, from the labels the LLM named
 with high confidence (``speaker_map.llm.json``); an existing file is used as is.
 
 An episode already in the library with the same transcript is left alone (a
-missing voiceprint.json is added); one with another transcript is reported as a
-conflict and not touched. So the command can be re-run. ``--apply`` holds the
-library's ``.library-update.lock``. Afterwards run ``media-asr enrich`` and
+missing voiceprint.json is added); one with another transcript, or whose id or
+source the library has, is reported as a conflict and not touched, also when
+it appears after the survey (checked again under the item lock and a database
+write lock before anything is written). So the command can be re-run.
+``--apply`` holds the library's ``.library-update.lock``; an archive and a
+library that are the same directory or inside one another are refused. Afterwards run ``media-asr enrich`` and
 ``media-asr correct-terms`` (or ``library-update``) with the All-In show in
 ``library.toml`` (docs/examples/podcast-library.toml).
 """
@@ -248,24 +251,43 @@ def copy(source: Path, target: Path) -> None:
     tmp.replace(target)
 
 
+class Conflict(RuntimeError):
+    """The library got the episode (or its source, or another transcript there)."""
+
+
 def migrate_one(episode: Episode, store: Store, library: Path, marker: dict | None) -> int:
-    """Files, then voiceprint.json, then the database rows (the commit point:
-    an interrupted episode is not in the library yet and is migrated again).
-    Returns the number of segments indexed."""
+    """Migrate one episode; returns the number of segments indexed.
+
+    Under the item lock and an immediate transaction (no other database writer
+    until it ends), first checks again that the library has neither the id nor
+    the source and no other transcript in ``items/<id>/`` (raising Conflict
+    before writing anything), then writes the files, voiceprint.json and the
+    rows, and commits: an interrupted episode is not in the library and is
+    migrated again."""
     target = library / "items" / episode.id
     target.mkdir(parents=True, exist_ok=True)
+    row = episode.row
+    segments = [s for s in episode.segments if str(s.get("text", "")).strip()]
     with item_lock(target):
-        for name in RUN_FILES:
-            if (episode.run / name).exists():
-                copy(episode.run / name, target / name)
-        if (episode.item_dir / "meta.json").exists():
-            copy(episode.item_dir / "meta.json", target / "meta.json")
-        if marker is not None:
-            V.write(target, marker)
-        row = episode.row
-        segments = [s for s in episode.segments if str(s.get("text", "")).strip()]
-        with store.conn:
-            store.conn.execute(
+        conn = store.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            taken = conn.execute(
+                "SELECT id FROM items WHERE id = ? OR source = ?", (episode.id, row["source"])
+            ).fetchone()
+            if taken:
+                raise Conflict(f"the library has {taken[0]} with this id or source")
+            transcript = target / "transcript.json"
+            if transcript.exists() and transcript.read_bytes() != episode.transcript_bytes:
+                raise Conflict("items/<id>/transcript.json is another transcript")
+            for name in RUN_FILES:
+                if (episode.run / name).exists():
+                    copy(episode.run / name, target / name)
+            if (episode.item_dir / "meta.json").exists():
+                copy(episode.item_dir / "meta.json", target / "meta.json")
+            if marker is not None:
+                V.write(target, marker)
+            conn.execute(
                 """
                 INSERT INTO items
                     (id, source, source_type, title, duration, language, status, audio_path,
@@ -289,7 +311,7 @@ def migrate_one(episode: Episode, store: Store, library: Path, marker: dict | No
                     now_iso(),
                 ),
             )
-            store.conn.executemany(
+            conn.executemany(
                 "INSERT INTO segments (item_id, idx, start, end, text, speaker) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 [
@@ -297,23 +319,63 @@ def migrate_one(episode: Episode, store: Store, library: Path, marker: dict | No
                     for i, s in enumerate(segments)
                 ],
             )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
     return len(segments)
 
 
-def coverage(markers: dict[str, dict]) -> dict:
-    """How much the voiceprints name: labels by decision, and the speaking time
-    of labels named by voice."""
+def finish_one(episode: Episode, store: Store, library: Path, marker: dict) -> bool:
+    """Add the missing voiceprint.json of an episode migrated before, under its
+    lock, if the library still has it done with the archive's transcript.
+    Raises Conflict otherwise; False if the marker is there by now."""
+    target = library / "items" / episode.id
+    with item_lock(target):
+        row = store.conn.execute("SELECT status FROM items WHERE id = ?", (episode.id,)).fetchone()
+        transcript = target / "transcript.json"
+        if (
+            row is None
+            or row["status"] != "done"
+            or not transcript.exists()
+            or (transcript.read_bytes() != episode.transcript_bytes)
+        ):
+            raise Conflict("the library's episode changed since the survey")
+        if (target / V.MARKER).exists():
+            return False
+        V.write(target, marker)
+    return True
+
+
+def durations(segments: list[dict]) -> dict[str, float]:
+    """Seconds of speech per speaker label (None: unlabelled), as in label_voices."""
+    out: dict = collections.defaultdict(float)
+    for s in segments:
+        out[s.get("speaker")] += float(s["end"]) - float(s["start"])
+    return out
+
+
+def coverage(judged: list[tuple[list[dict], dict]]) -> dict:
+    """How much the voiceprints name, over (segments, voiceprint.json) pairs:
+    labels by decision; the share of all speaking time in labels named by voice;
+    and the mean of that share per episode."""
     labels = collections.Counter()
-    named, total = 0.0, 0.0
-    for marker in markers.values():
-        for rec in marker["speakers"].values():
+    named = total = 0.0
+    shares = []
+    for segments, marker in judged:
+        seconds = durations(segments)
+        whole = sum(seconds.values())
+        by_voice = 0.0
+        for label, rec in marker["speakers"].items():
             labels[rec["voice"]] += 1
-            share = rec.get("share") or 0.0
-            total += share
-            named += share if rec["voice"] == "match" else 0.0
+            by_voice += seconds.get(label, 0.0) if rec["voice"] == "match" else 0.0
+        named, total = named + by_voice, total + whole
+        if whole:
+            shares.append(by_voice / whole)
     return {
         "labels": dict(labels),
         "speaking_time_named_by_voice": round(named / total, 4) if total else None,
+        "mean_per_episode": round(sum(shares) / len(shares), 4) if shares else None,
     }
 
 
@@ -343,6 +405,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="write (default: dry run)")
     args = parser.parse_args(argv)
     archive, library = args.archive.expanduser().resolve(), args.library.expanduser().resolve()
+    if archive == library or archive in library.parents or library in archive.parents:
+        print(f"error: the archive and the library overlap: {archive}, {library}", file=sys.stderr)
+        return 2
     if not args.apply:
         summary, _ = survey(archive, library, quiet=True)
         print(json.dumps(summary, ensure_ascii=False, indent=1))
@@ -386,7 +451,9 @@ def survey(archive: Path, library: Path, *, quiet: bool) -> tuple[dict, dict]:
         "references": sorted(refs),
         "references_file": f"{refs_path} ({'exists' if built is None else 'built from the archive'})",
         "reference_seeds": {n: list(v) for n, v in built["seed_counts"].items()} if built else None,
-        "voiceprint_coverage": coverage(markers),
+        "voiceprint_coverage": coverage(
+            [(e.segments, markers[e.id]) for e in episodes if e.id in markers]
+        ),
         "agreement_with_archive": agreement(episodes, markers),
         "feed": feed["url"] if feed else None,
     }
@@ -440,14 +507,18 @@ def apply(library: Path, archive: Path, work: dict, summary: dict) -> dict:
             try:
                 applied["segments"] += migrate_one(episode, store, library, markers.get(episode.id))
                 applied["episodes"] += 1
+            except Conflict:
+                summary["conflicts"].append(episode.id)
             except Exception as exc:  # noqa: BLE001 - this episode only; re-run
                 summary.setdefault("failed", []).append(f"{episode.id}: {exc}")
         for episode in todo["same"]:  # finish an interrupted earlier run
             target = library / "items" / episode.id
             if episode.id in markers and not (target / V.MARKER).exists():
-                with item_lock(target):
-                    V.write(target, markers[episode.id])
-                applied["voiceprints added"] += 1
+                try:
+                    if finish_one(episode, store, library, markers[episode.id]):
+                        applied["voiceprints added"] += 1
+                except Conflict:
+                    summary["conflicts"].append(episode.id)
     finally:
         store.close()
     return dict(applied)

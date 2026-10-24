@@ -199,6 +199,7 @@ def test_a_dry_run_reports_and_writes_nothing(dirs, capsys) -> None:
     assert summary["voiceprint_coverage"] == {
         "labels": {"match": 10, "insufficient": 5},
         "speaking_time_named_by_voice": 0.9877,
+        "mean_per_episode": 0.9877,
     }
     assert summary["agreement_with_archive"]["labels"] == {"same": 15}
     assert "library_toml" not in summary
@@ -345,3 +346,112 @@ def test_enrich_then_names_the_migrated_episodes_by_voice(dirs, capsys, monkeypa
     roles = json.loads((library / "items" / ids[0] / "enrich.json").read_text())["speakers"]
     assert (roles["SPEAKER_00"]["role"], roles["SPEAKER_02"]["role"]) == ("host", "guest")
     store.close()
+
+
+def test_an_episode_the_library_got_after_the_survey_is_left_alone(dirs) -> None:
+    # Review 0.0.4 #2: the files were copied over the library's newer episode
+    # before the INSERT found the conflict.
+    archive, library, ids = dirs
+    summary, work = M.survey(archive, library, quiet=False)
+    episode = work["todo"]["migrate"][0]
+    other = Store(library / "media.db")  # another writer adds and transcribes it now
+    item, _ = other.add_item(
+        source=episode.row["source"], source_type="podcast", title="newer", feed_url=FEED
+    )
+    assert item == episode.id
+    target = library / "items" / item
+    target.mkdir(parents=True)
+    newer = json.dumps(
+        {"segments": [{"start": 0, "end": 1, "text": "a newer transcript", "speaker": "X"}]}
+    )
+    (target / "transcript.json").write_text(newer)
+    other.save_result(
+        item,
+        segments=[Segment(0, 1, "a newer transcript", "X")],
+        duration=1.0,
+        language="en",
+        model="newer",
+        transcript_path=str(target / "transcript.md"),
+    )
+    other.close()
+    applied = M.apply(library, archive, work, summary)
+    assert summary["conflicts"] == [item] and "failed" not in summary
+    assert applied == {"episodes": 4, "segments": 12}
+    assert (target / "transcript.json").read_text() == newer
+    assert not (target / "voiceprint.json").exists() and not (target / "transcript.md").exists()
+    db = sqlite3.connect(library / "media.db")
+    assert db.execute("SELECT text FROM segments WHERE item_id = ?", (item,)).fetchall() == [
+        ("a newer transcript",)
+    ]
+    db.close()
+
+
+def test_a_missing_marker_is_added_only_to_the_episode_migrated(dirs, capsys) -> None:
+    archive, library, ids = dirs
+    migrate(archive, library, "--apply", capsys=capsys)
+    target = library / "items" / ids[0]
+    (target / "voiceprint.json").unlink()
+    summary, work = M.survey(archive, library, quiet=False)
+    assert work["todo"]["same"][0].id == ids[0]
+    retold = (target / "transcript.json").read_text().replace("a talks", "a spoke")
+    (target / "transcript.json").write_text(retold)  # re-transcribed after the survey
+    assert M.apply(library, archive, work, summary) == {}
+    assert summary["conflicts"] == [ids[0]] and not (target / "voiceprint.json").exists()
+
+
+@pytest.mark.parametrize("where", ["same", "library inside", "archive inside"])
+def test_an_archive_and_library_that_overlap_are_refused(
+    tmp_path: Path, capsys, where: str
+) -> None:
+    # Review 0.0.4 #4: --library = --archive wrote a lock and the references
+    # into the archive (and opened its database for writing) before failing.
+    archive = tmp_path / "data"
+    make_archive(archive)
+    library = {"same": archive, "library inside": archive / "lib", "archive inside": tmp_path}[
+        where
+    ]
+    before = files(tmp_path)
+    for flags in ([], ["--apply"]):
+        assert M.main(["--archive", str(archive), "--library", str(library), *flags]) == 2
+    assert "overlap" in capsys.readouterr().err
+    assert files(tmp_path) == before
+
+
+def test_coverage_is_weighted_by_speaking_time() -> None:
+    # Review 0.0.4 #5: a 10 s episode named by voice and a 100 s one not named
+    # read as 50%; by speaking time it is 9.09%.
+    short = [{"start": 0, "end": 10, "speaker": "S0"}]
+    long = [{"start": 0, "end": 100, "speaker": "S0"}]
+    matched = {"speakers": {"S0": {"voice": "match", "share": 1.0}}}
+    unmatched = {"speakers": {"S0": {"voice": "no-match", "share": 1.0}}}
+    assert M.coverage([(short, matched), (long, unmatched)]) == {
+        "labels": {"match": 1, "no-match": 1},
+        "speaking_time_named_by_voice": 0.0909,
+        "mean_per_episode": 0.5,
+    }
+
+
+@pytest.mark.parametrize("meanwhile", ["row only", "transcript only"])
+def test_each_recheck_alone_keeps_the_library_intact(dirs, meanwhile: str) -> None:
+    archive, library, ids = dirs
+    summary, work = M.survey(archive, library, quiet=False)
+    episode = work["todo"]["migrate"][0]
+    target = library / "items" / episode.id
+    if meanwhile == "row only":  # media-asr add ran: the episode is pending, no files yet
+        other = Store(library / "media.db")
+        other.add_item(
+            source=episode.row["source"], source_type="podcast", title="added", feed_url=FEED
+        )
+        other.close()
+    else:  # a transcript the library does not index (left from elsewhere)
+        target.mkdir(parents=True)
+        (target / "transcript.json").write_text('{"segments": []}')
+    before = files(library)
+    M.apply(library, archive, work, summary)
+    assert summary["conflicts"] == [episode.id] and "failed" not in summary
+    after = files(library)
+    assert {
+        k: v
+        for k, v in after.items()
+        if k.startswith(f"items/{episode.id}/") and not k.endswith(".lock")
+    } == {k: v for k, v in before.items() if k.startswith(f"items/{episode.id}/")}
