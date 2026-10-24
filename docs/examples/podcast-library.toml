@@ -5,58 +5,83 @@
 #   feed      RSS feed URL, as subscribed with `media-asr add <feed> --latest N`;
 #             an episode belongs to the show when its feed URL contains this text
 #   language  "zh" or "en": Whisper language and punctuation prompt
-#   name      optional, for logs
+#   name      optional: for logs, and the show's name on the site that publishes its notes
 #   hosts     optional: recurring hosts who rarely say their own names on air,
 #             given to the speaker-naming prompt as context
 #   voiceprints  optional: reference voices (.npz, relative to the data directory);
 #             `media-asr voiceprint` names the speakers whose voice matches one
+#
+# Site metadata (optional; media-asr only checks it). qihan.ai reads its show list from
+# this file, so a show with a slug joins its daily podcast notes:
+#   slug      the show's id on the site: lowercase letters, digits, hyphens; unique
+#   short     short name for lists and badges (default: name)
+#   youtube_channel  channel whose uploads the site matches episodes against (video player)
 
 [[show]]
 name = "硅谷101"
+slug = "sv101"
+short = "硅谷101"
 feed = "https://feeds.fireside.fm/sv101/rss"
 language = "zh"
 
 [[show]]
 name = "晚点聊 LateTalk"
+slug = "latetalk"
+short = "晚点聊"
 feed = "https://feeds.fireside.fm/latetalk/rss"
 language = "zh"
 
 [[show]]
 name = "张小珺Jùn｜商业访谈录"
+slug = "zhangxiaojun"
+short = "张小珺"
 feed = "https://feed.xyzfm.space/dk4yh3pkpjp3"
 language = "zh"
 
 [[show]]
 name = "邵亦波｜一波一会"
+slug = "yibo-yihui"
+short = "一波一会"
 feed = "https://feed.xyzfm.space/q4dnrcam497p"
 language = "zh"
 
 [[show]]
 name = "开始连接 LinkStart"
+slug = "linkstart"
+short = "LinkStart"
 feed = "https://feed.xyzfm.space/q9a6lueucj6a"
 language = "zh"
 
 [[show]]
 name = "Latent Space"
+slug = "latent-space"
+short = "Latent Space"
 feed = "https://api.substack.com/feed/podcast/1084089.rss"
 language = "en"
 hosts = "swyx (Shawn Wang; editor of Latent Space, organizer of the AI Engineer conference, AIE) and Alessio Fanelli (partner at Kernel Labs)"
 
 [[show]]
 name = "Automated with Brian Heater"
+slug = "automated"
+short = "Automated"
 feed = "https://rss.buzzsprout.com/2630998.rss"
 language = "en"
 hosts = "Brian Heater"
 
 [[show]]
 name = "Robot Talk"
+slug = "robot-talk"
+short = "Robot Talk"
 feed = "https://rss.libsyn.com/shows/292433/destinations/2292818.xml"
 language = "en"
 hosts = "Claire Asher"
 
 [[show]]
-name = "All-In"
+name = "All-In Podcast"
+slug = "all-in"
+short = "All-In"
 feed = "https://allinchamathjason.libsyn.com/rss"
 language = "en"
 hosts = "Jason Calacanis, Chamath Palihapitiya, David Sacks and David Friedberg"
 voiceprints = "voiceprints/all-in.npz"
+youtube_channel = "https://www.youtube.com/@allin/videos"

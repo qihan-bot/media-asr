@@ -4,11 +4,14 @@ A podcast library is a data directory (``MEDIA_ASR_DATA``) whose
 ``library.toml`` lists the shows, one ``[[show]]`` table each:
 
     [[show]]
-    name = "Latent Space"                     # optional, for logs
+    name = "Latent Space"                     # optional: logs, and the show's name on a site
     feed = "https://api.substack.com/feed/podcast/1084089.rss"
     language = "en"                           # zh or en
     hosts = "swyx and Alessio Fanelli"        # optional speaker-naming hint
     voiceprints = "voiceprints/show.npz"      # optional reference voices (media-asr voiceprint)
+    slug = "latent-space"                     # optional site metadata, checked here and used
+    short = "Latent Space"                    #   by the site that publishes the shows' notes;
+                                              #   also youtube_channel (All-In: .../@allin/videos)
 
 An episode belongs to a show when its feed URL contains ``feed``; use the URL
 the feed was subscribed with (``media-asr add <feed> --latest N``).
@@ -45,7 +48,11 @@ ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / "media-asr-remote"
 MEDIA_ASR = [sys.executable, "-m", "media_asr"]
 LANGUAGES = ("zh", "en")
-SHOW_KEYS = {"name", "feed", "language", "hosts", "voiceprints"}
+SHOW_KEYS = {"name", "feed", "language", "hosts", "voiceprints", "slug", "short", "youtube_channel"}
+# Optional string keys; slug, short and youtube_channel are metadata for the site that
+# publishes the shows' notes (qihan.ai reads them from this file), not used by media-asr.
+TEXT_KEYS = ("name", "hosts", "voiceprints", "slug", "short", "youtube_channel")
+SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # Completion markers of the steps built on transcript.json; `media-asr run`
 # drops them before it writes a new transcript, so these steps run again.
 STEP_MARKERS = ("rediarize.json", "voiceprint.json", "enrich.json", "terms.json")
@@ -66,6 +73,9 @@ class Show:
     name: str = ""
     hosts: str = ""
     voiceprints: str = ""  # reference voices, relative to the data directory
+    slug: str = ""  # site metadata: the show's id (lowercase, digits, hyphens)
+    short: str = ""  # site metadata: short display name
+    youtube_channel: str = ""  # site metadata: channel the episodes are matched against
 
     def matches(self, feed_url: str | None) -> bool:
         return self.feed in (feed_url or "")
@@ -99,23 +109,25 @@ def load_shows(path: Path | None = None, *, missing_ok: bool = False) -> list[Sh
             raise LibraryError(f"{where}: feed (the RSS URL) is required")
         if entry.get("language") not in LANGUAGES:
             raise LibraryError(f"{where}: language must be one of {', '.join(LANGUAGES)}")
-        if any(not isinstance(entry.get(key, ""), str) for key in ("name", "hosts", "voiceprints")):
-            raise LibraryError(f"{where}: name, hosts and voiceprints must be strings")
-        shows.append(
-            Show(
-                feed=entry["feed"].strip(),
-                language=entry["language"],
-                name=entry.get("name", "").strip(),
-                hosts=entry.get("hosts", "").strip(),
-                voiceprints=entry.get("voiceprints", "").strip(),
+        if any(not isinstance(entry.get(key, ""), str) for key in TEXT_KEYS):
+            raise LibraryError(
+                f"{where}: {', '.join(TEXT_KEYS[:-1])} and {TEXT_KEYS[-1]} must be strings"
             )
-        )
+        text = {key: entry.get(key, "").strip() for key in TEXT_KEYS}
+        if text["slug"] and not SLUG.fullmatch(text["slug"]):
+            raise LibraryError(f"{where}: slug must be lowercase letters, digits and hyphens")
+        if text["youtube_channel"] and not text["youtube_channel"].startswith("https://"):
+            raise LibraryError(f"{where}: youtube_channel must be an https URL")
+        shows.append(Show(feed=entry["feed"].strip(), language=entry["language"], **text))
     if not shows:
         raise LibraryError(f"{path}: no [[show]] entries")
     for show in shows:
         for other in shows:
             if other is not show and show.feed in other.feed:
                 raise LibraryError(f"{path}: feed {show.feed} also matches {other.feed}")
+    slugs = [show.slug for show in shows if show.slug]
+    if duplicate := next((slug for slug in slugs if slugs.count(slug) > 1), None):
+        raise LibraryError(f"{path}: slug {duplicate} is used by more than one show")
     return shows
 
 

@@ -51,6 +51,31 @@ def test_example_config_has_the_old_hard_coded_shows_and_all_in() -> None:
         assert host in all_in.hosts
 
 
+# qihan.ai's show table before it read this file (tools/podcast_library_jobs.py SHOWS): the
+# published notes are keyed by these names and slugs, so the example must keep them.
+SITE_SHOWS = {
+    "allinchamathjason": ("All-In Podcast", "all-in", "All-In"),
+    "feeds.fireside.fm/sv101": ("硅谷101", "sv101", "硅谷101"),
+    "feeds.fireside.fm/latetalk": ("晚点聊 LateTalk", "latetalk", "晚点聊"),
+    "dk4yh3pkpjp3": ("张小珺Jùn｜商业访谈录", "zhangxiaojun", "张小珺"),
+    "q4dnrcam497p": ("邵亦波｜一波一会", "yibo-yihui", "一波一会"),
+    "q9a6lueucj6a": ("开始连接 LinkStart", "linkstart", "LinkStart"),
+    "feed/podcast/1084089": ("Latent Space", "latent-space", "Latent Space"),
+    "rss.buzzsprout.com/2630998": ("Automated with Brian Heater", "automated", "Automated"),
+    "destinations/2292818": ("Robot Talk", "robot-talk", "Robot Talk"),
+}
+
+
+def test_example_config_carries_the_site_show_metadata() -> None:
+    shows = L.load_shows(EXAMPLE)
+    assert len(shows) == len(SITE_SHOWS)
+    for fragment, (name, slug, short) in SITE_SHOWS.items():
+        (show,) = [s for s in shows if fragment in s.feed]
+        assert (show.name, show.slug, show.short) == (name, slug, short)
+        expected = "https://www.youtube.com/@allin/videos" if slug == "all-in" else ""
+        assert show.youtube_channel == expected
+
+
 def write(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "library.toml"
     path.write_text(text, encoding="utf-8")
@@ -72,6 +97,24 @@ def write(tmp_path: Path, text: str) -> Path:
         ),
         ('[[show]]\nfeed = "https://a/rss"\nlanguage = "zh"\nhosts = ["A"]\n', "must be strings"),
         ('[[show]]\nfeed = "https://a/rss"\nlanguage = "zh"\nvoiceprints = 1\n', "must be strings"),
+        ('[[show]]\nfeed = "https://a/rss"\nlanguage = "zh"\nslug = 1\n', "must be strings"),
+        (
+            '[[show]]\nfeed = "https://a/rss"\nlanguage = "zh"\nslug = "Sv 101"\n',
+            "slug must be lowercase",
+        ),
+        (
+            '[[show]]\nfeed = "https://a/rss"\nlanguage = "zh"\nslug = "-a"\n',
+            "slug must be lowercase",
+        ),
+        (
+            '[[show]]\nfeed = "https://a/rss"\nlanguage = "zh"\nyoutube_channel = "http://y/c"\n',
+            "youtube_channel must be an https URL",
+        ),
+        (
+            '[[show]]\nfeed = "https://a/rss"\nlanguage = "zh"\nslug = "x"\n'
+            '[[show]]\nfeed = "https://b/rss"\nlanguage = "en"\nslug = "x"\n',
+            "slug x is used by more than one show",
+        ),
         (
             '[[show]]\nfeed = "https://a/feed"\nlanguage = "zh"\n'
             '[[show]]\nfeed = "https://a/feed2"\nlanguage = "en"\n',
@@ -94,11 +137,20 @@ def test_show_fields_and_matching(tmp_path: Path) -> None:
     path = write(
         tmp_path,
         '[[show]]\nname = " A "\nfeed = " https://a/rss "\nlanguage = "zh"\nhosts = "Ann"\n'
+        'slug = " show-a "\nshort = " A1 "\nyoutube_channel = " https://www.youtube.com/@a/videos "\n'
         '[[show]]\nfeed = "https://b/rss"\nlanguage = "en"\nvoiceprints = " v/b.npz "\n',
     )
     shows = L.load_shows(path)
     assert shows == [
-        L.Show(feed="https://a/rss", language="zh", name="A", hosts="Ann"),
+        L.Show(
+            feed="https://a/rss",
+            language="zh",
+            name="A",
+            hosts="Ann",
+            slug="show-a",
+            short="A1",
+            youtube_channel="https://www.youtube.com/@a/videos",
+        ),
         L.Show(feed="https://b/rss", language="en", voiceprints="v/b.npz"),
     ]
     assert L.host_hints(shows, "https://a/rss") == "Ann"
