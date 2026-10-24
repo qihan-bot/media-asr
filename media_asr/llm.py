@@ -49,6 +49,15 @@ class TruncatedResponse(RuntimeError):
     """The answer hit ``max_tokens`` before its JSON was complete."""
 
 
+def text_answer(content: str | None, finish_reason: str | None = None) -> str:
+    """A plain-text answer: cut off at ``max_tokens`` or empty counts as failed."""
+    if finish_reason == "length":
+        raise TruncatedResponse("answer cut off at max_tokens")
+    if not (content or "").strip():
+        raise ValueError("empty answer")
+    return content
+
+
 def parse_json(content: str, finish_reason: str | None = None):
     """Parse a JSON answer, tolerating a Markdown code fence around it."""
     text = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.M)
@@ -87,14 +96,27 @@ class LLM:
         last failure, or TruncatedResponse if that answer was cut off at
         ``max_tokens``.
         """
+        return self._ask(system, user, max_tokens, json_mode=True)
+
+    def chat_text(self, system: str, user: str, max_tokens: int) -> str:
+        """Return the answer as plain text, without JSON mode (e.g. a translated Markdown section).
+
+        The DGX server accepts ``response_format`` but does not enforce it, so a long Markdown answer
+        often arrives unwrapped; ask for text when text is the answer. Same endpoint check, cap on
+        requests in flight and attempts as ``chat``; an empty answer is retried.
+        """
+        return self._ask(system, user, max_tokens, json_mode=False)
+
+    def _ask(self, system: str, user: str, max_tokens: int, *, json_mode: bool):
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "temperature": 0,
             "max_tokens": max_tokens,
             "thinking": {"type": "disabled"},
-            "response_format": {"type": "json_object"},
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         last: Exception | None = None
         for attempt in range(ATTEMPTS):
             if attempt:
@@ -110,7 +132,9 @@ class LLM:
                     )
                 response.raise_for_status()
                 choice = response.json()["choices"][0]
-                return parse_json(choice["message"]["content"], choice.get("finish_reason"))
+                if json_mode:
+                    return parse_json(choice["message"]["content"], choice.get("finish_reason"))
+                return text_answer(choice["message"].get("content"), choice.get("finish_reason"))
             except Exception as exc:  # noqa: BLE001 - retried, then surfaced
                 last = exc
         error = TruncatedResponse if isinstance(last, TruncatedResponse) else RuntimeError

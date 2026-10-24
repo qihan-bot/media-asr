@@ -130,3 +130,26 @@ def test_concurrency_is_capped_across_threads(monkeypatch) -> None:
     for t in threads:
         t.join()
     assert peak[0] == 2
+
+
+def test_chat_text_returns_plain_text_without_json_mode() -> None:
+    client = Client(Response("   "), Response("## In one sentence\n\nText."))
+    llm = L.LLM("key", model="m", client=client)
+    assert llm.chat_text("system", "user", 100) == "## In one sentence\n\nText."
+    assert [p["temperature"] for p in client.payloads] == [0, 0.3]  # the empty answer was retried
+    first = client.payloads[0]
+    assert "response_format" not in first and first["thinking"] == {"type": "disabled"}
+    assert first["max_tokens"] == 100
+
+
+def test_chat_text_cut_off_at_max_tokens_is_truncation() -> None:
+    client = Client(*[Response("## Partial", "length")] * 5)
+    with pytest.raises(L.TruncatedResponse, match="LLM request failed"):
+        L.LLM("key", client=client).chat_text("system", "user", 10)
+    assert len(client.payloads) == 5
+
+
+def test_chat_keeps_json_mode() -> None:
+    client = Client(Response('{"ok": 1}'))
+    assert L.LLM("key", client=client).chat("system", "user", 10) == {"ok": 1}
+    assert client.payloads[0]["response_format"] == {"type": "json_object"}
