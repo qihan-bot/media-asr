@@ -232,3 +232,81 @@ def test_single_line_cut_off_fails_the_episode(tmp_path: Path, capsys) -> None:
     assert not (items_dir / item / "terms.json").exists()
     assert "FAIL" in capsys.readouterr().out
     store.close()
+
+
+class FixedClient:
+    """DeepSeek stand-in that proposes the same fixes for every chunk."""
+
+    def __init__(self, fixes: list[tuple[str, str]]):
+        self.fixes = [{"wrong": w, "right": r, "confidence": "high"} for w, r in fixes]
+
+    def post(self, url, *, headers, json, timeout):
+        return Response(json_dumps({"fixes": self.fixes}), "stop")
+
+    def close(self) -> None:
+        pass
+
+
+def correct(tmp_path: Path, texts: list[str], fixes: list[tuple[str, str]]) -> tuple[dict, list]:
+    """Run correct-terms on one item; return terms.json and the corrected texts,
+    after checking that files and search index agree."""
+    store, items_dir, item = make_item(tmp_path, texts)
+    with llm.LLM("key", client=FixedClient(fixes)) as model:
+        assert C.run(store.conn, model, items_dir=items_dir) == 0
+    report = json.loads((items_dir / item / "terms.json").read_text())
+    named = json.loads((items_dir / item / "transcript_named.json").read_text())
+    out = [s["text"] for s in named["segments"]]
+    assert [row["text"] for row in store.segments_for(item)] == out
+    assert report["replacements"] == sum(f["count"] for f in report["applied"])
+    store.close()
+    return report, out
+
+
+def test_corrections_never_rescan_their_own_output(tmp_path: Path) -> None:
+    # Live library, buzzsprout 2b4e61a8: "Rota AI" became "Rhoda AI AI".
+    fixes = [("Rota AI", "Rhoda AI"), ("Rhoda", "Rhoda AI")]
+    report, out = correct(tmp_path, ["Rota AI and Rhoda."], fixes)
+    assert out == ["Rhoda AI and Rhoda AI."]
+    assert {f["wrong"]: f["count"] for f in report["applied"]} == {"Rota AI": 1, "Rhoda": 1}
+
+
+def test_already_correct_text_is_left_alone(tmp_path: Path) -> None:
+    report, out = correct(
+        tmp_path, ["Rhoda AI builds robots; Rhoda ships."], [("Rhoda", "Rhoda AI")]
+    )
+    assert out == ["Rhoda AI builds robots; Rhoda AI ships."]
+    assert report["applied"][0]["count"] == 1
+
+
+def test_audit_counts_replacements_actually_made(tmp_path: Path) -> None:
+    report, out = correct(
+        tmp_path, ["冷量运输。冷量运输"], [("冷量运输", "冷链运输"), ("冷量", "冷链")]
+    )
+    assert out == ["冷链运输。冷链运输"]
+    assert [(f["wrong"], f["count"]) for f in report["applied"]] == [("冷量运输", 2)]
+    assert report["replacements"] == 2
+    (unused,) = [r for r in report["rejected"] if r["wrong"] == "冷量"]
+    assert unused["rejected"] == "every occurrence is part of a longer correction or a correct form"
+    assert "count" not in unused and "tier" not in unused
+
+
+@pytest.mark.parametrize(
+    ("wrong", "right"),
+    [("Mathbb", r"\mathbb"), ("nvdia-smi", r"\nvidia-smi"), ("Grupe", r"Grupe\1")],
+)
+def test_right_form_is_inserted_literally(tmp_path: Path, wrong: str, right: str) -> None:
+    report, out = correct(tmp_path, [f"{wrong} and {wrong}."], [(wrong, right)])
+    assert out == [f"{right} and {right}."]
+    assert report["applied"][0]["right"] == right and report["applied"][0]["count"] == 2
+
+
+def test_apply_fixes_is_one_pass_longest_first() -> None:
+    segments = [{"text": "Open Cloud Moment, Open Cloud"}, {"text": "no match"}]
+    accepted = [
+        {"wrong": "Open Cloud", "right": "OpenClaw", "tier": "model", "count": 2},
+        {"wrong": "Open Cloud Moment", "right": "OpenClaw Moment", "tier": "model", "count": 1},
+    ]
+    applied, unused = C.apply_fixes(segments, accepted)
+    assert [s["text"] for s in segments] == ["OpenClaw Moment, OpenClaw", "no match"]
+    assert {f["wrong"]: f["count"] for f in applied} == {"Open Cloud": 1, "Open Cloud Moment": 1}
+    assert unused == [] and C.apply_fixes(segments, []) == ([], [])

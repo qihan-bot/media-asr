@@ -3,7 +3,8 @@
 ``media-asr correct-terms`` runs after ``enrich`` and keeps its guarantee
 auditable: the model never rewrites text. It only proposes ``wrong -> right``
 pairs; this step filters them and applies the survivors as literal
-replacements, recording every pair and its count in ``terms.json``.
+replacements in one pass over the uncorrected text, recording every pair and
+the number of replacements it made in ``terms.json``.
 
 A pair is applied only if ``wrong`` occurs verbatim in the transcript, sounds
 like a mishearing of ``right``, and has a basis:
@@ -37,6 +38,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from functools import lru_cache
@@ -203,6 +205,42 @@ def select(
     return accepted, rejected
 
 
+def apply_fixes(segments: list[dict], accepted: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Replace the accepted ``wrong`` forms in one pass over the original text.
+
+    Matches never overlap and the longest wins ("冷量运输" before "冷量"); text
+    that already reads as an accepted ``right`` is left alone ("Rhoda AI" stays
+    when "Rhoda" -> "Rhoda AI" is accepted); a replacement is inserted
+    literally and never matched again. Returns (applied, unused): the pairs
+    with the number of replacements they made, and the pairs that made none.
+    """
+    if not accepted:
+        return [], []
+    output = {fix["right"]: fix["right"] for fix in accepted}
+    for fix in accepted:
+        output.setdefault(fix["wrong"], fix["right"])
+    keys = sorted(output, key=lambda text: (-len(text), text))
+    rx = re.compile("|".join(pattern(key).pattern for key in keys))
+    made: Counter = Counter()
+
+    def replace(match: re.Match) -> str:
+        found = match.group(0)
+        if output[found] != found:
+            made[found] += 1
+        return output[found]
+
+    for seg in segments:
+        seg["text"] = rx.sub(replace, seg["text"])
+    applied = [{**fix, "count": made[fix["wrong"]]} for fix in accepted if made[fix["wrong"]]]
+    unused = [
+        {key: value for key, value in fix.items() if key not in ("tier", "count")}
+        | {"rejected": "every occurrence is part of a longer correction or a correct form"}
+        for fix in accepted
+        if not made[fix["wrong"]]
+    ]
+    return applied, unused
+
+
 def find_fixes(llm: LLM, lines: list[str], prompt_for, label: str = "") -> list[dict]:
     """Ask for the fixes in one chunk of lines. An answer cut off at the token
     limit (too many fixes) splits the chunk in two and asks for each half."""
@@ -251,11 +289,7 @@ def correct_item(row, notes, titles_by_feed, show_titles, llm: LLM, items_dir: P
 
     full_text = "\n".join(s["text"] for s in segments)
     accepted, rejected = select(fixes, full_text, reference, set(speakers))
-    # Longer wrong forms first, so "Open Cloud Moment" wins over "Open Cloud".
-    for fix in sorted(accepted, key=lambda f: -len(f["wrong"])):
-        rx = pattern(fix["wrong"])
-        for seg in segments:
-            seg["text"] = rx.sub(fix["right"], seg["text"])
+    applied, unused = apply_fixes(segments, accepted)
 
     temp_dir = item_dir / "_terms_tmp"
     render_all(
@@ -285,9 +319,9 @@ def correct_item(row, notes, titles_by_feed, show_titles, llm: LLM, items_dir: P
     report = {
         "corrected_at": now_iso(),
         "model": llm.model,
-        "applied": accepted,
-        "rejected": rejected,
-        "replacements": sum(f["count"] for f in accepted),
+        "applied": applied,
+        "rejected": rejected + unused,
+        "replacements": sum(f["count"] for f in applied),
     }
     return {"row": row, "segments": segments, "report": report}
 
