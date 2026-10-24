@@ -268,17 +268,23 @@ Files per episode:
 
 ```text
 items/<id>/
-  transcript.*         # ASR + diarization (SPEAKER_00 labels); only rediarize rewrites it
+  transcript.*         # ASR + diarization (SPEAKER_00 labels); rewritten only by run
   rediarize.json       # merged-speaker check: label, share before/after, verdict
   transcript_named.*   # punctuated, speakers named, terms corrected; indexed for search
   named_base.json      # punctuated and named segments before term correction
   enrich.json          # punctuated segment count, each speaker name with its evidence
   terms.json           # applied pairs with tier and count, rejected pairs with the reason
+  .lock                # held while a step writes this episode
 ```
 
 `rediarize.json`, `enrich.json` and `terms.json` are completion markers: each
-step skips items that have its marker. `rediarize` removes `enrich.json` of the
-episodes it redoes, and `enrich` removes `terms.json`, so later steps run again.
+step skips items that have its marker. `run` removes all three before it writes
+a new transcript, and `enrich` removes `terms.json`, so later steps run again.
+A step writes an episode's files and index rows while holding `items/<id>/.lock`,
+after checking that its input has not changed since it was read, and removes
+its own marker before overwriting anything, so an interrupted write is redone on
+the next run. `library-update` holds `.library-update.lock` in the data
+directory; a second update exits 1.
 
 Audit and rollback:
 
@@ -287,14 +293,18 @@ Audit and rollback:
 - Speaker names are used only at high or medium confidence; other labels become
   `Host N`, `Guest N` or `Speaker N` (`主持人N`, `嘉宾N`, `说话人N`).
 - In term correction the model never rewrites text. It proposes `wrong -> right`
-  pairs, and a pair is applied as a literal replacement only if it sounds like a
-  mishearing (a Chinese pair keeps its length and its syllables are within 0.4
-  toneless pinyin similarity, one exception allowed in three or more syllables;
-  an English pair keeps a spelling similarity of 0.55, 0.65 for short tokens;
-  the wrong form is not a common word) and has a basis: tier `reference` (the right form is in the show notes, episode titles or
-  speaker names) or tier `model` (a well-known term rated high confidence).
-  `terms.json` lists every pair with its tier and count, and every rejected pair
-  with the reason.
+  pairs, and a pair is accepted only if it sounds like a mishearing (a Chinese
+  pair keeps its length and its syllables are within 0.4 toneless pinyin
+  similarity, one exception allowed in three or more syllables; an English pair
+  keeps a spelling similarity of 0.55, 0.65 for short tokens; the wrong form is
+  not a common word) and has a basis: tier `reference` (the right form is in the
+  show notes, episode titles or speaker names) or tier `model` (a well-known
+  term rated high confidence). Accepted pairs replace text literally in one pass
+  over the uncorrected transcript: the longest match wins, text that already
+  reads as a right form is left alone, and a replacement is never matched again.
+  `terms.json` lists every applied pair with its tier and the number of
+  replacements it made, and every rejected pair with the reason (including
+  accepted pairs that had nothing left to replace).
 - Each step keeps its input: `enrich` reads the raw `transcript.json`, and
   `correct-terms` always starts from `named_base.json`, so corrections never
   compound. `correct-terms --ids <id> --force` rebuilds the corrected transcript,

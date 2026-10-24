@@ -19,19 +19,29 @@ Podcast library: the process scripts became package modules and subcommands.
   instead of hard-coded lists; see `docs/examples/podcast-library.toml`.
 - One DeepSeek client (`media_asr/llm.py`) for all steps; the model comes from
   `MEDIA_ASR_LLM_MODEL` (was `MEDIA_ASR_ENRICH_MODEL`).
-- `correct-terms`: `max_tokens` 3000 → 8000, and an answer cut off at the limit
+- `correct-terms`: accepted pairs replace text literally in one pass over the
+  uncorrected transcript (longest match first; text that already reads as a
+  right form is left alone; no replacement is matched again, which wrote
+  "Rhoda AI AI" before), and `terms.json` counts the replacements actually
+  made. `max_tokens` 3000 → 8000, and an answer cut off at the limit
   splits the chunk in two instead of failing the episode. Chinese pairs must
   sound alike: toneless pinyin similarity of at least 0.4 for every character
   pair, one exception allowed in three or more syllables (巨星智能 → 具身智能
   is kept, 余昊 → 宇树 rejected); English pairs need a spelling similarity of
   0.55 (was 0.5). `named_base.json` (written by `enrich`) is required.
+- Each library step writes an episode under a lock on `items/<id>/.lock`, after
+  checking that its input has not changed and after removing its markers, so an
+  interrupted write is redone; `run` removes the later steps' markers before it
+  writes a new transcript; one `library-update` per library at a time;
+  `rediarize` keeps going when one episode fails.
 - `run --feed-contains` limits a run to one feed, `run --ids` processes exactly
-  the given items; the same title in the same feed is the same episode; direct
+  the given items; the same title in the same feed is the same episode (an
+  episode not yet transcribed takes the feed's current download URL); direct
   downloads are retried 3 times.
 - Optional extras `library` (wordfreq, jieba, pypinyin).
 - `scripts/`: All-In speaker-naming tools (pyannote diarization of existing
-  transcripts, LLM speaker maps, voiceprint verification) and the All-In daily
-  script `podcast_daily.sh`.
+  transcripts, LLM speaker maps, voiceprint verification, using the configured
+  remote shell and port) and the All-In daily script `podcast_daily.sh`.
 
 ## 0.01 — 2026-10-19
 

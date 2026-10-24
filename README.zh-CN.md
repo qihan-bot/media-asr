@@ -250,17 +250,21 @@ hosts = "swyx (Shawn Wang) and Alessio Fanelli"     # 可选
 
 ```text
 items/<id>/
-  transcript.*         # 转写 + 说话人分离（SPEAKER_00 标签）；只有 rediarize 会重写
+  transcript.*         # 转写 + 说话人分离（SPEAKER_00 标签）；只有 run 会重写
   rediarize.json       # 合并检查：标签、前后占比、判断结果
   transcript_named.*   # 补标点、标姓名、术语纠错后的文稿；检索索引指向它
   named_base.json      # 术语纠错前的补标点、标姓名片段
   enrich.json          # 补标点的片段数、每个说话人姓名及依据
   terms.json           # 采用的替换对（层级、次数）和被拒绝的替换对（原因）
+  .lock                # 某一步写这期文件时持有的锁
 ```
 
 `rediarize.json`、`enrich.json`、`terms.json` 是完成标记：每一步跳过已有自己
-标记的条目。`rediarize` 会删除重做节目的 `enrich.json`，`enrich` 会删除
-`terms.json`，后续步骤因此会重新执行。
+标记的条目。`run` 写新转写之前会删除这三个标记，`enrich` 会删除 `terms.json`，
+后续步骤因此会重新执行。每一步写某期的文件和索引时都持有 `items/<id>/.lock`，
+先确认输入自读取后没有变化，并在覆盖任何文件之前删除自己的标记，所以写到一半
+中断的条目会在下次运行时重做。`library-update` 持有数据目录下的
+`.library-update.lock`，同时启动的第二个更新会以 1 退出。
 
 审计与回滚：
 
@@ -270,10 +274,12 @@ items/<id>/
 - 术语纠错时模型不改写文稿，只提出 `wrong -> right` 替换对。一个替换对要同时
   听起来像误听（中文两边字数相同，且每对汉字的无声调拼音相似度不低于 0.4，
   三个及以上音节时允许一对例外；英文拼写相似度不低于 0.55，短词 0.65；错误
-  写法不是常用词），并且有依据：
-  `reference` 层级（正确写法出现在节目简介、其他期标题或说话人姓名里），或
-  `model` 层级（模型高置信度认定的知名名词），才会按字面替换。`terms.json`
-  记录每个替换对的层级和次数，以及每个被拒绝的替换对和原因。
+  写法不是常用词），并且有依据：`reference` 层级（正确写法出现在节目简介、
+  其他期标题或说话人姓名里），或 `model` 层级（模型高置信度认定的知名名词），
+  才会被采用。采用的替换对在未纠错的文稿上一次性按字面替换：最长的匹配优先，
+  已经是正确写法的文字不动，替换出来的文字不会再被匹配。`terms.json` 记录每个
+  采用的替换对的层级和实际替换次数，以及每个被拒绝的替换对和原因（包括采用后
+  已无可替换之处的替换对）。
 - 每一步都保留输入：`enrich` 读取原始的 `transcript.json`，`correct-terms`
   总是从 `named_base.json` 开始，纠错不会叠加。`correct-terms --ids <id> --force`
   重建纠错后的文稿（例如规则修改之后）；`enrich --ids <id> --force` 从原始转写
