@@ -225,3 +225,28 @@ def test_repair_refuses_stale_map(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="does not match"):
         repair_speakers.process(run, None, "key")
     assert json.loads((run / "speaker_map.json").read_text())["labels_fp"] == labels_fingerprint(old)
+
+
+def test_embed_driver_passes_remote_shell_and_port(tmp_path: Path, monkeypatch) -> None:
+    recorded: dict = {}
+
+    class Stop(Exception):
+        pass
+
+    class Remote:
+        def __init__(self, host: str, **kwargs) -> None:
+            recorded.update(kwargs)
+
+        def connect(self) -> None:
+            raise Stop()
+
+    monkeypatch.setattr(embed_speakers, "EMB_DIR", tmp_path)
+    monkeypatch.setattr(embed_speakers, "episodes", lambda label: [{"id": "ep", "fp": "fp"}])
+    monkeypatch.setattr(embed_speakers, "RemoteGPU", Remote)
+    monkeypatch.setenv("MEDIA_ASR_REMOTE_HOST", "gpu.example")
+    monkeypatch.setenv("MEDIA_ASR_REMOTE_SHELL", "sh")
+    monkeypatch.setenv("MEDIA_ASR_REMOTE_PORT", "2222")
+    monkeypatch.setattr(sys, "argv", ["embed_speakers.py"])
+    with pytest.raises(Stop):
+        embed_speakers.main()
+    assert recorded["shell"] == "sh" and recorded["port"] == 2222

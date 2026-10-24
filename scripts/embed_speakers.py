@@ -75,8 +75,10 @@ def main() -> int:
     remote = RemoteGPU(
         os.environ["MEDIA_ASR_REMOTE_HOST"],
         user=os.environ.get("MEDIA_ASR_REMOTE_USER", ""),
+        port=int(os.environ.get("MEDIA_ASR_REMOTE_PORT", 22)),
         workdir=os.environ.get("MEDIA_ASR_REMOTE_WORKDIR", "media-asr-work"),
         python=os.environ.get("MEDIA_ASR_REMOTE_PYTHON", r".venv\Scripts\python.exe"),
+        shell=os.environ.get("MEDIA_ASR_REMOTE_SHELL", "cmd"),
         key_filename=os.environ.get("MEDIA_ASR_REMOTE_KEY"),
         timeout=4 * 3600,
     )
