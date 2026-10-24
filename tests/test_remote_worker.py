@@ -563,11 +563,15 @@ def test_run_embed_runs_its_own_job_and_returns_the_arrays(tmp_path: Path, monke
 
     remote = RemoteGPU("gpu", shell="sh", workdir="work", python=".venv/bin/python")
     remote._client, remote._sftp, remote._home = object(), FakeSFTP(), "/home/u"
-    job = "/home/u/work/jobs/ep_1.voiceprint"
     commands: list[str] = []
+    jobs: list[str] = []
 
     def fake_exec(command, *, timeout, progress=None):
         commands.append(command)
+        (job,) = [
+            d for d in remote._sftp.dirs if d.startswith("/home/u/work/jobs/ep_1.voiceprint-")
+        ]
+        jobs.append(job)
         spec = json.loads(remote._sftp.files[f"{job}/job.json"])
         assert (
             spec["kind"] == "embed"
@@ -603,12 +607,67 @@ def test_run_embed_runs_its_own_job_and_returns_the_arrays(tmp_path: Path, monke
     segments = [{"start": 0.0, "end": 5.0}, {"start": 5.0, "end": 9.0}]
     emb, seg, samples, fingerprint = remote.run_embed(item, segments, "fp")
     assert emb.shape == (2, 256) and list(seg) == [0, 1] and fingerprint == "fp"
+    (job,) = jobs
+    rel = job.removeprefix("/home/u/work/")
     assert uploads == [f"{job}/remote_worker.py", f"{job}/media_asr.zip"]
     assert commands == [
-        'cd "$HOME/work" && .venv/bin/python "jobs/ep_1.voiceprint/remote_worker.py" --job "jobs/ep_1.voiceprint/job.json"'
+        f'cd "$HOME/work" && .venv/bin/python "{rel}/remote_worker.py" --job "{rel}/job.json"'
     ]
     assert not [path for path in remote._sftp.files if path.startswith(job)]  # cleaned up
+    assert job not in remote._sftp.dirs
     local = tmp_path / "audio.mp3"
     local.write_bytes(b"mp3")
     with pytest.raises(Exception, match="downloadable source"):
         remote.run_embed({"id": "x", "source": str(local)}, segments, "fp")
+
+
+def test_two_voiceprint_runs_of_one_episode_keep_apart(tmp_path: Path) -> None:
+    # Review 0.0.4 #3: both runs used jobs/<id>.voiceprint; the first to finish
+    # removed it while the other was still computing there.
+    import numpy as np
+
+    sftp = FakeSFTP()
+    b_computing, a_cleaned = threading.Event(), threading.Event()
+    results: dict[str, object] = {}
+
+    def run(name: str) -> None:
+        remote = RemoteGPU("gpu", shell="sh", workdir="work", python="python3")
+        remote._client, remote._sftp, remote._home = object(), sftp, "/home/u"
+
+        def fake_exec(command, *, timeout, progress=None):
+            job = "/home/u/work/" + command.split('--job "')[1].rsplit("/job.json", 1)[0]
+            if name == "A":
+                assert b_computing.wait(5)
+            else:
+                b_computing.set()
+                assert a_cleaned.wait(5)  # A has finished and cleaned up
+            if job not in sftp.dirs:
+                raise OSError(f"{job} was removed by another job")
+            buffer = io.BytesIO()
+            np.savez(
+                buffer,
+                emb=np.ones((1, 3)),
+                seg=np.array([0]),
+                samples=np.array([16000]),
+                fp=np.array("fp"),
+            )
+            sftp.files[f"{job}/embeddings.npz"] = buffer.getvalue()
+            return ""
+
+        remote._exec = fake_exec
+        item = {"id": "same", "source": "https://a/same.mp3", "source_type": "podcast"}
+        try:
+            results[name] = remote.run_embed(item, [{"start": 0.0, "end": 2.0}], "fp")[3]
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+            results[name] = exc
+        finally:
+            if name == "A":
+                a_cleaned.set()
+
+    threads = [threading.Thread(target=run, args=(name,)) for name in ("A", "B")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert results == {"A": "fp", "B": "fp"}
+    assert not [d for d in sftp.dirs if ".voiceprint" in d]  # each cleaned up its own

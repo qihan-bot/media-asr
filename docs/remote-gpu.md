@@ -146,7 +146,8 @@ job's downloads overlap another's GPU work. A job that has to wait logs
   there.
 - Voiceprint jobs (`media-asr voiceprint`, `"kind": "embed"`) take the same
   lock to load the speaker-embedding model and embed an episode's segments,
-  in `jobs/<id>.voiceprint/`; their download and ffmpeg run outside it.
+  in a job directory of their own (`jobs/<id>.voiceprint-<random>/`); their
+  download and ffmpeg run outside it.
 
 Measured on an RTX 3080 Ti host (2026-10-24; `library-update` on a scratch
 library of 3 podcast episodes, 158 min of audio; nvidia-smi sampled every 0.5 s):

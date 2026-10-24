@@ -15,7 +15,7 @@ directory, held from loading Whisper to the end of diarization.
 
 A job with ``"kind": "embed"`` (``media-asr voiceprint``) instead embeds the
 given segments of the episode with the speaker-embedding model, under the same
-lock, and leaves ``jobs/<id>.voiceprint/embeddings.npz``.
+lock, and leaves ``embeddings.npz`` in its job directory.
 """
 
 from __future__ import annotations

@@ -8,6 +8,7 @@ import re
 import stat
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Callable
@@ -514,8 +515,9 @@ class RemoteGPU:
         and ffmpeg there; the speaker-embedding model under the GPU lock).
 
         Returns ``(emb, seg, samples, fingerprint)``, see
-        ``voiceprint.label_voices``. The job directory is ``jobs/<id>.voiceprint``,
-        apart from the episode's transcription job."""
+        ``voiceprint.label_voices``. Each call has its own job directory,
+        ``jobs/<id>.voiceprint-<random>``: two runs may embed the same episode at
+        once (the voiceprint step takes the item lock only to commit)."""
         import numpy as np
 
         if Path(str(item["source"])).expanduser().is_file():
@@ -523,7 +525,8 @@ class RemoteGPU:
         self.connect()
         log = progress or (lambda _: None)
         item_id = str(item["id"])
-        job_rel = posixpath.join("jobs", re.sub(r"[^A-Za-z0-9_.-]+", "_", item_id) + ".voiceprint")
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", item_id) + f".voiceprint-{uuid.uuid4().hex[:8]}"
+        job_rel = posixpath.join("jobs", name)
         job_dir = self._path(job_rel)
         try:
             meta = json.loads(item.get("meta_json") or "{}")
