@@ -28,6 +28,9 @@ import httpx
 
 from .config import DATA_DIR
 
+ROOT = Path(__file__).resolve().parent.parent
+# The source checkout's wrapper: loads MEDIA_ASR_REMOTE_ENV, remote full mode.
+REMOTE = ROOT / "media-asr-remote"
 LANGUAGES = ("zh", "en")
 SHOW_KEYS = {"name", "feed", "language", "hosts"}
 

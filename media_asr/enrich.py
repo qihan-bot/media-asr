@@ -1,47 +1,39 @@
-#!/usr/bin/env python3
-"""Punctuate and name speakers in a multi-show podcast library.
+"""Punctuate and name speakers in a podcast library (``media-asr enrich``).
 
-For every done item under ``MEDIA_ASR_DATA`` that has no ``enrich.json`` yet:
+For every done item that has no ``enrich.json`` yet:
 
 1. Punctuation: DeepSeek restores punctuation (and English casing) segment by
    segment. A segment is accepted only if its letters and digits are unchanged
    (NFKC, case-folded, punctuation and whitespace removed); otherwise the
    original text is kept, so this pass can never change what was said.
 2. Speakers: DeepSeek maps each ``SPEAKER_XX`` to a person using the show name,
-   episode title, the RSS show notes and the transcript. Only high/medium
-   confidence names are used; the rest become ``说话人N`` / ``Speaker N``.
+   the recurring hosts from ``library.toml``, the episode title, the RSS show
+   notes and the transcript. Only high/medium confidence names are used; the
+   rest become ``主持人N`` / ``Host N``, ``嘉宾N`` / ``Guest N`` or
+   ``说话人N`` / ``Speaker N``.
 
-Writes ``transcript_named.{md,srt,txt,json}`` and ``enrich.json`` (the
-completion marker) next to the original transcript, which is left untouched,
-then points the SQLite index at the enriched text and speaker names.
-
-Run through Vault: ``vibe vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value
--- python3 scripts/enrich_podcasts.py``.
+Writes ``transcript_named.{md,srt,txt,json}``, ``named_base.json`` (the input
+of ``correct-terms``) and ``enrich.json`` (the completion marker) next to the
+original transcript, which is left untouched, removes ``terms.json`` so the
+item is corrected again, and points the SQLite index at the named transcript.
 """
 
 from __future__ import annotations
 
-import argparse
-import html
 import json
-import os
 import re
 import sqlite3
-import sys
-import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-import feedparser
-import httpx
+from .config import ITEMS_DIR
+from .library import Show, episode_notes, host_hints, load_show_notes
+from .llm import LLM
+from .render import render_all
+from .transcribe import TranscriptSegment
+from .util import atomic_write, now_iso
 
-from media_asr.config import DB_PATH, ITEMS_DIR
-from media_asr.render import render_all
-from media_asr.transcribe import TranscriptSegment
-from media_asr.util import atomic_write, now_iso, sanitize_proxy_env
-
-API_URL = "https://api.deepseek.com/chat/completions"
-MODEL = os.environ.get("MEDIA_ASR_ENRICH_MODEL", "deepseek-flash")
 CHUNK_CHARS = {"zh": 2500, "en": 6000}
 
 PUNCT_PROMPT = {
@@ -60,16 +52,6 @@ PUNCT_PROMPT = {
     ),
 }
 
-# Recurring hosts who rarely say their own names on air (feed URL substring ->
-# hint). Only shows where the transcript alone left hosts unnamed.
-SHOW_HOSTS = {
-    "feed/podcast/1084089": (
-        "swyx (Shawn Wang; editor of Latent Space, organizer of the AI Engineer "
-        "conference, AIE) and Alessio Fanelli (partner at Kernel Labs)"
-    ),
-    "rss.buzzsprout.com/2630998": "Brian Heater",
-    "destinations/2292818": "Claire Asher",
-}
 UNNAMED = {
     "zh": {"host": "主持人", "guest": "嘉宾", "other": "说话人"},
     "en": {"host": "Host", "guest": "Guest", "other": "Speaker"},
@@ -111,33 +93,7 @@ def norm(text: str) -> str:
     return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", text)).casefold()
 
 
-def chat(client: httpx.Client, key: str, system: str, user: str, max_tokens: int) -> dict:
-    payload = {
-        "model": MODEL,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-    }
-    last: Exception | None = None
-    for attempt in range(3):
-        # Greedy decoding repeats a malformed answer; retries sample a little.
-        payload["temperature"] = 0 if attempt == 0 else 0.3
-        try:
-            response = client.post(
-                API_URL, headers={"Authorization": f"Bearer {key}"}, json=payload, timeout=300
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            return json.loads(re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.M))
-        except Exception as exc:  # noqa: BLE001 - retried, then surfaced
-            last = exc
-            time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"DeepSeek request failed: {last}")
-
-
-def punctuate(client, key, texts: list[str], lang: str, workers: int) -> tuple[list[str], int]:
+def punctuate(llm: LLM, texts: list[str], lang: str, workers: int) -> tuple[list[str], int]:
     """Return punctuated texts and how many segments were accepted.
 
     Pass 1 sends large chunks; segments it did not return verbatim (count
@@ -162,9 +118,7 @@ def punctuate(client, key, texts: list[str], lang: str, workers: int) -> tuple[l
             8000, int(sum(len(line) for line in lines) * (1.6 if lang == "zh" else 0.6)) + 500
         )
         try:
-            result = chat(client, key, PUNCT_PROMPT[lang], "\n".join(lines), tokens).get(
-                "lines", []
-            )
+            result = llm.chat(PUNCT_PROMPT[lang], "\n".join(lines), tokens).get("lines", [])
         except Exception:  # noqa: BLE001 - keep the original text for this chunk
             return []
         return [(i, str(new)) for i, new in zip(chunk, result) if isinstance(new, str)]
@@ -209,44 +163,20 @@ def speaker_context(segments: list[dict], limit: int = 16000) -> tuple[str, str]
     return stats, "\n".join(lines)
 
 
-def load_show_notes(db: sqlite3.Connection) -> tuple[dict[str, str], dict[str, str]]:
-    """Map audio URL and "feed URL<TAB>episode title" -> plain-text show notes,
-    and feed URL -> show title. The title key survives a feed changing hosts."""
-    notes: dict[str, str] = {}
-    titles: dict[str, str] = {}
-    for url, title in db.execute("SELECT url, title FROM feeds"):
-        titles[url] = title or url
-        try:
-            parsed = feedparser.parse(httpx.get(url, timeout=60, follow_redirects=True).text)
-        except Exception as exc:  # noqa: BLE001 - show notes are optional evidence
-            print(f"feed fetch failed {url}: {exc}", flush=True)
-            continue
-        for entry in parsed.entries:
-            body = entry.get("summary") or entry.get("description") or ""
-            text = html.unescape(re.sub(r"<[^>]+>", " ", body))
-            text = re.sub(r"\s+", " ", text).strip()[:3000]
-            notes[f"{url}\t{entry.get('title', '')}"] = text
-            for link in entry.get("enclosures", []):
-                if link.get("href"):
-                    notes[link["href"]] = text
-    return notes, titles
-
-
-def episode_notes(notes: dict, row: sqlite3.Row) -> str:
-    meta = json.loads(row["meta_json"] or "{}")
-    return (
-        notes.get(meta.get("audio_url") or row["source"])
-        or notes.get(f"{row['feed_url']}\t{row['title']}")
-        or "(not available)"
-    )
-
-
-def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, workers: int) -> dict:
-    item_dir = ITEMS_DIR / row["id"]
+def enrich_item(
+    row: sqlite3.Row,
+    notes: dict,
+    titles: dict,
+    shows: list[Show],
+    llm: LLM,
+    workers: int,
+    items_dir: Path,
+) -> dict:
+    item_dir = items_dir / row["id"]
     data = json.loads((item_dir / "transcript.json").read_text(encoding="utf-8"))
     segments = [s for s in data.get("segments", []) if str(s.get("text", "")).strip()]
     lang = "zh" if (row["language"] or data.get("language") or "").startswith("zh") else "en"
-    texts, accepted = punctuate(client, key, [s["text"] for s in segments], lang, workers)
+    texts, accepted = punctuate(llm, [s["text"] for s in segments], lang, workers)
     for seg, text in zip(segments, texts):
         seg["text"] = text
 
@@ -256,15 +186,13 @@ def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, worker
         stats, excerpt = speaker_context(segments)
         prompt = SPEAKER_PROMPT.format(
             show=titles.get(row["feed_url"], row["feed_url"] or ""),
-            hosts=next(
-                (v for k, v in SHOW_HOSTS.items() if k in (row["feed_url"] or "")), "(not given)"
-            ),
+            hosts=host_hints(shows, row["feed_url"]) or "(not given)",
             title=row["title"],
             notes=episode_notes(notes, row),
             stats=stats,
             transcript=excerpt,
         )
-        raw = chat(client, key, "You label podcast speakers. Output valid JSON only.", prompt, 2000)
+        raw = llm.chat("You label podcast speakers. Output valid JSON only.", prompt, 2000)
         raw = raw.get("speakers", raw)
         unknown: dict[str, int] = {}
         for label in labels:
@@ -301,7 +229,7 @@ def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, worker
         source=data.get("source") or row["source"],
         duration=data.get("duration") or row["duration"],
         language=data.get("language") or row["language"],
-        model=(data.get("model") or "") + f" + {MODEL} punctuation/speaker names",
+        model=(data.get("model") or "") + f" + {llm.model} punctuation/speaker names",
         transcribed_at=now_iso(),
         segments=named,
     )
@@ -312,7 +240,7 @@ def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, worker
     temp_dir.rmdir()
     report = {
         "enriched_at": now_iso(),
-        "model": MODEL,
+        "model": llm.model,
         "segments": len(segments),
         "punctuated_segments": accepted,
         "speakers": names,
@@ -320,9 +248,9 @@ def enrich_item(row: sqlite3.Row, notes: dict, titles: dict, client, key, worker
     return {"row": row, "segments": segments, "report": report}
 
 
-def write_index(db: sqlite3.Connection, result: dict) -> None:
+def write_index(db: sqlite3.Connection, result: dict, items_dir: Path) -> None:
     row = result["row"]
-    item_dir = ITEMS_DIR / row["id"]
+    item_dir = items_dir / row["id"]
     with db:
         db.execute("DELETE FROM segments WHERE item_id = ?", (row["id"],))
         db.executemany(
@@ -336,7 +264,7 @@ def write_index(db: sqlite3.Connection, result: dict) -> None:
             "UPDATE items SET transcript_path = ?, updated_at = ? WHERE id = ?",
             (str(item_dir / "transcript_named.md"), now_iso(), row["id"]),
         )
-    # Punctuated, named text before term correction; correct_terms.py always
+    # Punctuated, named text before term correction; correct-terms always
     # starts from this file, and must run again after every enrichment.
     atomic_write(
         item_dir / "named_base.json",
@@ -349,64 +277,55 @@ def write_index(db: sqlite3.Connection, result: dict) -> None:
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=0, help="0 = all pending items")
-    parser.add_argument("--ids", nargs="*", default=None, help="only these item ids")
-    parser.add_argument("--force", action="store_true", help="redo items that have enrich.json")
-    parser.add_argument("--workers", type=int, default=6, help="items in parallel")
-    parser.add_argument("--chunk-workers", type=int, default=4, help="requests per item")
-    args = parser.parse_args()
-
-    key = os.environ.get("DEEPSEEK_API_KEY")
-    if not key:
-        print("set DEEPSEEK_API_KEY; run through `vibe vault run`", file=sys.stderr)
-        return 1
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
+def run(
+    db: sqlite3.Connection,
+    llm: LLM,
+    shows: list[Show],
+    *,
+    ids: list[str] | None = None,
+    force: bool = False,
+    limit: int = 0,
+    workers: int = 6,
+    chunk_workers: int = 4,
+    items_dir: Path = ITEMS_DIR,
+) -> int:
+    """Enrich pending items (or ``ids``); return 1 if any item failed."""
     rows = [
         row
         for row in db.execute("SELECT * FROM items WHERE status = 'done' ORDER BY published_at")
-        if (args.ids is None or row["id"] in args.ids)
-        and (args.force or not (ITEMS_DIR / row["id"] / "enrich.json").exists())
+        if (ids is None or row["id"] in ids)
+        and (force or not (items_dir / row["id"] / "enrich.json").exists())
     ]
-    if args.limit:
-        rows = rows[: args.limit]
+    if limit:
+        rows = rows[:limit]
     print(f"items: {len(rows)}", flush=True)
     if not rows:
         return 0
-    sanitize_proxy_env()  # httpx rejects the IPv6 CIDR entries in NO_PROXY
     notes, titles = load_show_notes(db)
     failed = 0
-    # DeepSeek is reached directly; the office proxy is not needed for it.
-    with httpx.Client(trust_env=False) as client:
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {
-                pool.submit(enrich_item, row, notes, titles, client, key, args.chunk_workers): row
-                for row in rows
-            }
-            for index, future in enumerate(as_completed(futures), start=1):
-                row = futures[future]
-                try:
-                    result = future.result()
-                    write_index(db, result)
-                except Exception as exc:  # noqa: BLE001 - report and continue
-                    failed += 1
-                    print(
-                        f"[{index}/{len(rows)}] FAIL {row['id']} {row['title'][:40]}: {exc}",
-                        flush=True,
-                    )
-                    continue
-                report = result["report"]
-                names = ", ".join(sorted({v["name"] for v in report["speakers"].values()}))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(enrich_item, row, notes, titles, shows, llm, chunk_workers, items_dir): row
+            for row in rows
+        }
+        for index, future in enumerate(as_completed(futures), start=1):
+            row = futures[future]
+            try:
+                result = future.result()
+                write_index(db, result, items_dir)
+            except Exception as exc:  # noqa: BLE001 - report and continue
+                failed += 1
                 print(
-                    f"[{index}/{len(rows)}] ok {row['title'][:40]} | punct "
-                    f"{report['punctuated_segments']}/{report['segments']} | {names}",
+                    f"[{index}/{len(rows)}] FAIL {row['id']} {row['title'][:40]}: {exc}",
                     flush=True,
                 )
+                continue
+            report = result["report"]
+            names = ", ".join(sorted({v["name"] for v in report["speakers"].values()}))
+            print(
+                f"[{index}/{len(rows)}] ok {row['title'][:40]} | punct "
+                f"{report['punctuated_segments']}/{report['segments']} | {names}",
+                flush=True,
+            )
     print(f"done={len(rows) - failed} failed={failed}", flush=True)
     return 1 if failed else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -58,15 +58,15 @@ if [[ -n $failed ]]; then echo "FAILED episodes:"; echo "$failed"; status=1; fi
 
 echo "== re-diarize episodes where one label merged several people"
 vibe vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value --env HF_TOKEN=HF_TOKEN.value -- \
-  python3 scripts/rediarize_merged.py || status=1
+  ./media-asr rediarize || status=1
 
 echo "== punctuation + speaker names"
 vibe vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value -- \
-  python3 scripts/enrich_podcasts.py --workers 4 || status=1
+  ./media-asr enrich --workers 4 || status=1
 
 echo "== term correction (audited replacement pairs, see terms.json)"
 vibe vault run --env DEEPSEEK_API_KEY=DEEPSEEK_API_KEY.value -- \
-  python3 scripts/correct_terms.py --workers 4 || status=1
+  ./media-asr correct-terms --workers 4 || status=1
 
 echo "== $(date -Is) end status=$status"
 ./media-asr stats

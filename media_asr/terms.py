@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
 """Correct misrecognized names and terms in enriched podcast transcripts.
 
-Runs after ``enrich_podcasts.py`` and keeps its guarantee auditable: the model
-never rewrites text. It only proposes ``wrong -> right`` pairs; this script
-filters them and applies the survivors as literal replacements, recording every
-pair and its count in ``terms.json``.
+``media-asr correct-terms`` runs after ``enrich`` and keeps its guarantee
+auditable: the model never rewrites text. It only proposes ``wrong -> right``
+pairs; this step filters them and applies the survivors as literal
+replacements, recording every pair and its count in ``terms.json``.
 
 A pair is applied only if ``wrong`` occurs verbatim in the transcript, sounds
 like a mishearing of ``right``, and has a basis:
@@ -22,37 +21,31 @@ like a mishearing of ``right``, and has a basis:
 
 Pairs that map one ``wrong`` to two different forms, or whose ``wrong`` is
 under two characters, are dropped. ASCII ``wrong`` forms match whole words only.
-Needs ``wordfreq`` and ``jieba``.
+Needs the ``library`` extras (wordfreq, jieba).
 
-Input is ``named_base.json`` (punctuated, named, uncorrected; created from
-``transcript_named.json`` for items enriched before it existed); output is
-``transcript_named.*`` plus the search index. ``terms.json`` is the completion
-marker, and ``enrich_podcasts.py`` removes it, so every re-enrichment is
-corrected again. Run through Vault with ``DEEPSEEK_API_KEY``.
+Input is ``named_base.json`` (punctuated, named, uncorrected; written by
+``enrich``); output is ``transcript_named.*`` plus the search index.
+``terms.json`` is the completion marker, and ``enrich`` removes it, so every
+re-enrichment is corrected again.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import re
 import sqlite3
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from pathlib import Path
 
-import httpx
 from wordfreq import zipf_frequency
 
-from media_asr.config import DB_PATH, ITEMS_DIR
-from media_asr.render import render_all
-from media_asr.transcribe import TranscriptSegment
-from media_asr.util import atomic_write, now_iso, sanitize_proxy_env
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from enrich_podcasts import MODEL, chat, episode_notes, load_show_notes  # noqa: E402
+from .config import ITEMS_DIR
+from .library import episode_notes, load_show_notes
+from .llm import LLM
+from .render import render_all
+from .transcribe import TranscriptSegment
+from .util import atomic_write, now_iso
 
 CHUNK_CHARS = {"zh": 6000, "en": 12000}
 CJK = re.compile(r"[一-鿿]")
@@ -176,13 +169,10 @@ def select(
     return accepted, rejected
 
 
-def correct_item(row, notes, titles_by_feed, show_titles, client, key) -> dict:
-    item_dir = ITEMS_DIR / row["id"]
+def correct_item(row, notes, titles_by_feed, show_titles, llm: LLM, items_dir: Path) -> dict:
+    item_dir = items_dir / row["id"]
     named = json.loads((item_dir / "transcript_named.json").read_text(encoding="utf-8"))
-    base_path = item_dir / "named_base.json"
-    if not base_path.exists():
-        atomic_write(base_path, json.dumps(named["segments"], ensure_ascii=False) + "\n")
-    segments = json.loads(base_path.read_text(encoding="utf-8"))
+    segments = json.loads((item_dir / "named_base.json").read_text(encoding="utf-8"))
     lang = "zh" if (row["language"] or "").startswith("zh") else "en"
     speakers = sorted({s.get("speaker") for s in segments if s.get("speaker")})
     note_text = episode_notes(notes, row)
@@ -201,8 +191,8 @@ def correct_item(row, notes, titles_by_feed, show_titles, client, key) -> dict:
             titles=other_titles or "(none)",
             chunk=chunk,
         )
-        result = chat(
-            client, key, "You find speech-recognition errors. Output valid JSON only.", prompt, 3000
+        result = llm.chat(
+            "You find speech-recognition errors. Output valid JSON only.", prompt, 3000
         )
         fixes.extend(f for f in result.get("fixes", []) if isinstance(f, dict))
 
@@ -222,7 +212,7 @@ def correct_item(row, notes, titles_by_feed, show_titles, client, key) -> dict:
         source=named.get("source") or row["source"],
         duration=named.get("duration") or row["duration"],
         language=named.get("language") or row["language"],
-        model=(named.get("model") or "").split(" + term")[0] + f" + term correction ({MODEL})",
+        model=(named.get("model") or "").split(" + term")[0] + f" + term correction ({llm.model})",
         transcribed_at=now_iso(),
         segments=[
             TranscriptSegment(
@@ -241,7 +231,7 @@ def correct_item(row, notes, titles_by_feed, show_titles, client, key) -> dict:
     temp_dir.rmdir()
     report = {
         "corrected_at": now_iso(),
-        "model": MODEL,
+        "model": llm.model,
         "applied": accepted,
         "rejected": rejected,
         "replacements": sum(f["count"] for f in accepted),
@@ -249,7 +239,7 @@ def correct_item(row, notes, titles_by_feed, show_titles, client, key) -> dict:
     return {"row": row, "segments": segments, "report": report}
 
 
-def write_index(db: sqlite3.Connection, result: dict) -> None:
+def write_index(db: sqlite3.Connection, result: dict, items_dir: Path) -> None:
     row = result["row"]
     with db:
         db.execute("DELETE FROM segments WHERE item_id = ?", (row["id"],))
@@ -261,23 +251,21 @@ def write_index(db: sqlite3.Connection, result: dict) -> None:
             ],
         )
     atomic_write(
-        ITEMS_DIR / row["id"] / "terms.json",
+        items_dir / row["id"] / "terms.json",
         json.dumps(result["report"], ensure_ascii=False, indent=2) + "\n",
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ids", nargs="*", default=None, help="only these item ids")
-    parser.add_argument("--force", action="store_true", help="redo items that have terms.json")
-    parser.add_argument("--workers", type=int, default=6)
-    args = parser.parse_args()
-    key = os.environ.get("DEEPSEEK_API_KEY")
-    if not key:
-        print("set DEEPSEEK_API_KEY; run through `vibe vault run`", file=sys.stderr)
-        return 1
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
+def run(
+    db: sqlite3.Connection,
+    llm: LLM,
+    *,
+    ids: list[str] | None = None,
+    force: bool = False,
+    workers: int = 6,
+    items_dir: Path = ITEMS_DIR,
+) -> int:
+    """Correct enriched items without ``terms.json`` (or ``ids``); return 1 if any failed."""
     every = db.execute("SELECT * FROM items WHERE status = 'done' ORDER BY published_at").fetchall()
     show_titles: dict[str, list[str]] = {}
     for row in every:
@@ -285,26 +273,25 @@ def main() -> int:
     rows = [
         row
         for row in every
-        if (args.ids is None or row["id"] in args.ids)
-        and (ITEMS_DIR / row["id"] / "enrich.json").exists()
-        and (args.force or not (ITEMS_DIR / row["id"] / "terms.json").exists())
+        if (ids is None or row["id"] in ids)
+        and (items_dir / row["id"] / "enrich.json").exists()
+        and (force or not (items_dir / row["id"] / "terms.json").exists())
     ]
     print(f"items: {len(rows)}", flush=True)
     if not rows:
         return 0
-    sanitize_proxy_env()
     notes, titles_by_feed = load_show_notes(db)
     failed = 0
-    with httpx.Client(trust_env=False) as client, ThreadPoolExecutor(args.workers) as pool:
+    with ThreadPoolExecutor(workers) as pool:
         futures = {
-            pool.submit(correct_item, row, notes, titles_by_feed, show_titles, client, key): row
+            pool.submit(correct_item, row, notes, titles_by_feed, show_titles, llm, items_dir): row
             for row in rows
         }
         for index, future in enumerate(as_completed(futures), start=1):
             row = futures[future]
             try:
                 result = future.result()
-                write_index(db, result)
+                write_index(db, result, items_dir)
             except Exception as exc:  # noqa: BLE001 - report and continue
                 failed += 1
                 print(
@@ -320,7 +307,3 @@ def main() -> int:
             )
     print(f"done={len(rows) - failed} failed={failed}", flush=True)
     return 1 if failed else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

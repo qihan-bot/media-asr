@@ -189,6 +189,29 @@ def build_parser() -> argparse.ArgumentParser:
     remote_check = sub.add_parser("remote-check", help="check the remote GPU host")
     add_remote_options(remote_check, backend=False)
 
+    enrich = sub.add_parser("enrich", help="podcast library: punctuation and speaker names")
+    enrich.add_argument("--ids", nargs="*", default=None, help="only these item ids")
+    enrich.add_argument("--force", action="store_true", help="redo items that have enrich.json")
+    enrich.add_argument("--limit", type=int, default=0, help="0 = all pending items")
+    enrich.add_argument("--workers", type=int, default=6, help="items in parallel")
+    enrich.add_argument("--chunk-workers", type=int, default=4, help="requests per item")
+
+    terms = sub.add_parser("correct-terms", help="podcast library: audited term correction")
+    terms.add_argument("--ids", nargs="*", default=None, help="only these item ids")
+    terms.add_argument("--force", action="store_true", help="redo items that have terms.json")
+    terms.add_argument("--workers", type=int, default=6, help="items in parallel")
+
+    rediarize = sub.add_parser(
+        "rediarize", help="podcast library: re-diarize episodes with merged speakers"
+    )
+    rediarize.add_argument(
+        "--share", type=float, default=0.75, help="largest-label share that triggers a check"
+    )
+    rediarize.add_argument(
+        "--dry-run", action="store_true", help="only report decisions; change nothing"
+    )
+    rediarize.add_argument("--shard", default="0/1", help="i/n: every n-th item, for parallel GPUs")
+
     sub.add_parser("feeds", help="list subscribed feeds")
     sub.add_parser("stats", help="show counts")
     sub.add_parser("init", help="create data directories")
@@ -223,6 +246,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_summarize(store, args)
         if args.command == "remove":
             return cmd_remove(store, args)
+        if args.command == "enrich":
+            return cmd_enrich(store, args)
+        if args.command == "correct-terms":
+            return cmd_correct_terms(store, args)
+        if args.command == "rediarize":
+            return cmd_rediarize(store, args)
         if args.command == "feeds":
             return cmd_feeds(store)
         if args.command == "stats":
@@ -802,6 +831,67 @@ def cmd_remove(store: Store, args: argparse.Namespace) -> int:
     store.delete_item(row["id"])
     _log(f"deleted {row['id']}")
     return 0
+
+
+def _deepseek_key() -> str | None:
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if not key:
+        print("set DEEPSEEK_API_KEY; run through `vibe vault run`", file=sys.stderr)
+    return key
+
+
+def cmd_enrich(store: Store, args: argparse.Namespace) -> int:
+    from . import enrich
+    from .library import LibraryError, load_shows
+    from .llm import LLM
+
+    key = _deepseek_key()
+    if not key:
+        return 1
+    try:
+        shows = load_shows(missing_ok=True)  # only for the recurring-host hints
+    except LibraryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    with LLM(key) as llm:
+        return enrich.run(
+            store.conn,
+            llm,
+            shows,
+            ids=args.ids,
+            force=args.force,
+            limit=args.limit,
+            workers=args.workers,
+            chunk_workers=args.chunk_workers,
+        )
+
+
+def cmd_correct_terms(store: Store, args: argparse.Namespace) -> int:
+    try:
+        from . import terms
+    except ImportError as exc:
+        print(f"error: {exc}; install the extras: pip install -e '.[library]'", file=sys.stderr)
+        return 1
+    from .llm import LLM
+
+    key = _deepseek_key()
+    if not key:
+        return 1
+    with LLM(key) as llm:
+        return terms.run(store.conn, llm, ids=args.ids, force=args.force, workers=args.workers)
+
+
+def cmd_rediarize(store: Store, args: argparse.Namespace) -> int:
+    from . import rediarize
+    from .llm import LLM
+
+    key = _deepseek_key()
+    if not key:
+        return 1
+    with LLM(key) as llm:
+        return rediarize.run(
+            store.conn, llm, share=args.share, dry_run=args.dry_run, shard=args.shard
+        )
 
 
 def cmd_feeds(store: Store) -> int:
