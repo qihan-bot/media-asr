@@ -282,7 +282,7 @@ transcription and `rediarize` are skipped and the run exits 1 (`enrich` and
 `correct-terms` still run). With neither option it uses `media-asr-remote`'s
 default (`MEDIA_ASR_REMOTE_ENV` or `~/.config/media-asr/remote.env`) unchecked.
 It calls the `media-asr-remote` wrapper of the source checkout, so run it from a
-clone. All LLM steps use `MEDIA_ASR_LLM_URL` (default `http://192.168.100.161:8889/v1/chat/completions`, the DGX) and `MEDIA_ASR_LLM_MODEL` (default `deepseek-v4.1-flash-tp4`); the key comes from `MEDIA_ASR_LLM_KEY` or `LAN_MODEL_API_KEY`.
+clone. All LLM steps use `MEDIA_ASR_LLM_URL` (default `http://192.168.31.161:8889/v1/chat/completions`, the DGX) and `MEDIA_ASR_LLM_MODEL` (default `deepseek-v4.1-flash-tp4`); the key comes from `MEDIA_ASR_LLM_KEY` or `LAN_MODEL_API_KEY`.
 
 With `--jobs N`, up to N episodes are in flight on the GPU host: one job's
 download and ffmpeg run while another uses the GPU, and the jobs take turns on

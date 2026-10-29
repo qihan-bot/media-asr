@@ -260,7 +260,7 @@ short = "Latent Space"                              # 可选，网站元数据
 两个选项都不给时，不做检查，直接用 `media-asr-remote` 的默认值
 （`MEDIA_ASR_REMOTE_ENV` 或 `~/.config/media-asr/remote.env`）。它调用源码目录里的
 `media-asr-remote` 包装脚本，所以要在克隆的仓库里运行。所有 DeepSeek 步骤使用
-`MEDIA_ASR_LLM_MODEL`（默认 `deepseek-v4.1-flash-tp4`），端点 `MEDIA_ASR_LLM_URL`（默认 DGX `http://192.168.100.161:8889/v1/chat/completions`），密钥 `MEDIA_ASR_LLM_KEY` 或 `LAN_MODEL_API_KEY`。
+`MEDIA_ASR_LLM_MODEL`（默认 `deepseek-v4.1-flash-tp4`），端点 `MEDIA_ASR_LLM_URL`（默认 DGX `http://192.168.31.161:8889/v1/chat/completions`），密钥 `MEDIA_ASR_LLM_KEY` 或 `LAN_MODEL_API_KEY`。
 
 `--jobs N` 时，GPU 主机上同时最多处理 N 期：一期在下载和 ffmpeg 时，另一期可以用
 GPU；各期通过远程 worker 的锁轮流使用 GPU（远程工作目录下的 `gpu.lock`，从加载

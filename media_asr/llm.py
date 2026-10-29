@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-DEFAULT_URL = "http://192.168.100.161:8889/v1/chat/completions"
+DEFAULT_URL = "http://192.168.31.161:8889/v1/chat/completions"
 DEFAULT_MODEL = "deepseek-v4.1-flash-tp4"
 ATTEMPTS = 5
 # Requests in flight to the shared model from this process, however the callers nest their thread pools.
@@ -59,13 +59,24 @@ def text_answer(content: str | None, finish_reason: str | None = None) -> str:
 
 
 def parse_json(content: str, finish_reason: str | None = None):
-    """Parse a JSON answer, tolerating a Markdown code fence around it."""
-    text = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.M)
+    """Parse a JSON answer, tolerating a Markdown code fence around it.
+
+    DeepSeek on the DGX sometimes stops (finish_reason "stop") one or two closing
+    braces short of a nested object; only that case, an answer that ends early,
+    is repaired by appending the missing closers.
+    """
+    text = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.M).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
         if finish_reason == "length":
             raise TruncatedResponse(f"answer cut off at max_tokens: {exc}") from exc
+        if exc.pos >= len(text):
+            for suffix in ("}", "}}", "]}", "}]}", "}}}"):
+                try:
+                    return json.loads(text + suffix)
+                except json.JSONDecodeError:
+                    pass
         raise
 
 
@@ -128,7 +139,8 @@ class LLM:
                         check_endpoint(self.url),
                         headers={"Authorization": f"Bearer {self.key}"},
                         json=payload,
-                        timeout=300,
+                        # Fail fast on an unreachable host; a slow answer still gets 300 s.
+                        timeout=httpx.Timeout(300, connect=10),
                     )
                 response.raise_for_status()
                 choice = response.json()["choices"][0]

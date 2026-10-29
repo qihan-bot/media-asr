@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from media_asr import llm as L
@@ -153,3 +155,15 @@ def test_chat_keeps_json_mode() -> None:
     client = Client(Response('{"ok": 1}'))
     assert L.LLM("key", client=client).chat("system", "user", 10) == {"ok": 1}
     assert client.payloads[0]["response_format"] == {"type": "json_object"}
+
+
+def test_parse_json_repairs_missing_closing_brace() -> None:
+    # Seen live 2026-10-29: speaker labels for a 19-speaker call stopped one brace short.
+    assert L.parse_json('{"speakers": {"SPEAKER_00": {"name": "A"}}', "stop") == {
+        "speakers": {"SPEAKER_00": {"name": "A"}}
+    }
+
+
+def test_parse_json_does_not_repair_mid_text_errors() -> None:
+    with pytest.raises(json.JSONDecodeError):
+        L.parse_json('{"a": 1 "b": 2}', "stop")
